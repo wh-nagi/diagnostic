@@ -134,8 +134,10 @@ qeval_reports/
 # Test output
 test_output.txt
 
-# Claude Code internals (not for distribution)
+# Local agent configuration, not for distribution
 .claude/
+.codex/
+.workspace/
 CLAUDE.md
 repomix.config.json
 repomix-output.xml
