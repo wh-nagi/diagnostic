@@ -1,4 +1,4 @@
-"""Demonstration of ML4T Evaluation 2.0 Result Schemas.
+"""Demonstration of ML4T Diagnostic result schemas.
 
 This example shows how to create, serialize, and use result schemas
 from all evaluation modules.
@@ -62,9 +62,11 @@ def demo_feature_diagnostics():
         acf_results=[acf_result],
         volatility_clustering={"garch_detected": True, "p": 1, "q": 1},
         distribution_stats={
-            "skewness": -0.3,
-            "kurtosis": 4.2,
-            "jarque_bera_pvalue": 0.001,
+            "momentum": {
+                "skewness": -0.3,
+                "kurtosis": 4.2,
+                "jarque_bera_pvalue": 0.001,
+            }
         },
     )
 
@@ -284,7 +286,7 @@ def demo_json_round_trip():
 def main():
     """Run all demonstrations."""
     print("\n" + "=" * 60)
-    print("ML4T Evaluation 2.0 Result Schemas Demo")
+    print("ML4T Diagnostic Result Schemas Demo")
     print("=" * 60)
 
     demo_feature_diagnostics()
