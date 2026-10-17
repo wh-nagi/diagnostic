@@ -64,7 +64,7 @@ def plot_cumulative_returns(
 
     fig = create_base_figure(
         title="Cumulative Returns",
-        xaxis_title="Date",
+        xaxis_title="Date" if analysis.has_dates else "Observation",
         yaxis_title="Cumulative Return",
         height=height,
         width=width,
@@ -83,7 +83,7 @@ def plot_cumulative_returns(
             mode="lines",
             name="Strategy",
             line={"color": theme_config["colorway"][0], "width": 2.5},
-            hovertemplate="Date: %{x}<br>Return: %{y:.2%}<extra></extra>",
+            hovertemplate="%{x}<br>Return: %{y:.2%}<extra></extra>",
         )
     )
 
@@ -97,7 +97,7 @@ def plot_cumulative_returns(
                 mode="lines",
                 name=benchmark_label,
                 line={"color": theme_config["colorway"][1], "width": 2.0, "dash": "dash"},
-                hovertemplate="Date: %{x}<br>Return: %{y:.2%}<extra></extra>",
+                hovertemplate="%{x}<br>Return: %{y:.2%}<extra></extra>",
             )
         )
 
@@ -161,7 +161,7 @@ def plot_rolling_returns(
 
     fig = create_base_figure(
         title="Rolling Returns",
-        xaxis_title="Date",
+        xaxis_title="Date" if rolling_result.dates.dtype.is_temporal() else "Observation",
         yaxis_title="Rolling Return",
         height=height,
         width=width,
@@ -262,13 +262,8 @@ def plot_annual_returns_bar(
         # Compute benchmark annual returns
         import polars as pl
 
-        # Align lengths — benchmark may be shorter than dates
         bench_arr = analysis.benchmark
         dates_arr = analysis.dates
-        if dates_arr is not None and len(bench_arr) != len(dates_arr):
-            n = min(len(bench_arr), len(dates_arr))
-            bench_arr = bench_arr[-n:]
-            dates_arr = dates_arr[-n:]
         bench_df = (
             pl.DataFrame(
                 {
@@ -349,14 +344,6 @@ def plot_monthly_returns_heatmap(
         z_values.append([np.nan if value is None else value for value in values])
 
     z_array = np.array(z_values)
-
-    # Crop years where all monthly returns are effectively zero
-    row_activity = np.nansum(np.abs(z_array), axis=1)
-    active_mask = row_activity > 1e-8
-    if active_mask.any() and not active_mask.all():
-        first_active = int(np.argmax(active_mask))
-        z_array = z_array[first_active:]
-        years = years[first_active:]
 
     # Add Annual total column (compounded monthly returns)
     annual_returns = []
@@ -481,25 +468,62 @@ def plot_returns_distribution(
         )
     )
 
-    # Normal fit
+    normal_fit = {"status": "not_requested", "reason": None}
     if show_normal:
+        if len(clean_returns) < 2:
+            reason = "A sample normal fit requires at least two observations."
+        elif np.ptp(clean_returns) == 0:
+            reason = "The observed returns have zero dispersion."
+        else:
+            reason = None
+        if reason is not None:
+            normal_fit = {"status": "unavailable", "reason": reason}
+    if show_normal and normal_fit["status"] != "unavailable":
         from scipy import stats as sp_stats
 
         mean = np.mean(clean_returns)
         std = np.std(clean_returns, ddof=1)
-
-        x_range = np.linspace(min(clean_returns), max(clean_returns), 100)
-        y_normal = sp_stats.norm.pdf(x_range, mean, std)
-
-        fig.add_trace(
-            go.Scatter(
-                x=x_range,
-                y=y_normal,
-                mode="lines",
-                name=f"Normal (μ={mean:.4f}, σ={std:.4f})",
-                line={"color": theme_config["colorway"][1], "width": 2, "dash": "dash"},
+        if np.isfinite(mean) and np.isfinite(std) and std > 0:
+            x_range = np.linspace(min(clean_returns), max(clean_returns), 100)
+            y_normal = sp_stats.norm.pdf(x_range, mean, std)
+            fig.add_trace(
+                go.Scatter(
+                    x=x_range,
+                    y=y_normal,
+                    mode="lines",
+                    name=f"Normal (μ={mean:.4f}, σ={std:.4f})",
+                    line={"color": theme_config["colorway"][1], "width": 2, "dash": "dash"},
+                )
             )
+            normal_fit = {"status": "available", "reason": None}
+        else:
+            normal_fit = {
+                "status": "unavailable",
+                "reason": "A sample normal fit requires finite mean and positive finite deviation.",
+            }
+    description = ""
+    if normal_fit["status"] == "unavailable":
+        description = f"Normal fit unavailable. {normal_fit['reason']}"
+        short_reason = (
+            "Fewer than two observations"
+            if len(clean_returns) < 2
+            else "Zero observed dispersion"
+            if np.ptp(clean_returns) == 0
+            else "Non-finite fit parameters"
         )
+        fig.add_annotation(
+            text=f"Normal fit unavailable<br>{short_reason}",
+            x=0,
+            y=1,
+            xref="paper",
+            yref="paper",
+            xanchor="left",
+            yanchor="top",
+            showarrow=False,
+            font={"size": 13},
+            hovertext=normal_fit["reason"],
+        )
+    fig.update_layout(meta={"normal_fit": normal_fit, "description": description})
 
     # Add VaR lines
     var_95 = np.percentile(clean_returns, 5)
@@ -511,7 +535,7 @@ def plot_returns_distribution(
         line_color="orange",
         annotation_text=f"VaR 95%: {var_95:.2%}",
         annotation_position="right",
-        annotation={"font": {"size": 10, "color": "orange"}},
+        annotation={"font": {"size": 14, "color": "orange"}},
     )
 
     fig.add_vline(
@@ -520,7 +544,7 @@ def plot_returns_distribution(
         line_color="red",
         annotation_text=f"VaR 99%: {var_99:.2%}",
         annotation_position="right",
-        annotation={"font": {"size": 10, "color": "red"}, "yshift": -20},
+        annotation={"font": {"size": 14, "color": "red"}, "yshift": -20},
     )
 
     fig.update_layout(

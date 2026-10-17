@@ -10,10 +10,12 @@ This module provides interactive Plotly visualizations for quantile analysis:
 from __future__ import annotations
 
 from datetime import datetime
+from numbers import Real
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import plotly.graph_objects as go
+import polars as pl
 
 from ml4t.diagnostic.utils.formatting import format_finite
 from ml4t.diagnostic.visualization.core import (
@@ -24,6 +26,8 @@ from ml4t.diagnostic.visualization.core import (
 )
 
 if TYPE_CHECKING:
+    import pandas as pd
+
     from ml4t.diagnostic.results.signal_results import QuantileAnalysisResult
 
 
@@ -139,15 +143,17 @@ def plot_quantile_returns_bar(
         spread = quantile_result.spread_mean.get(period, 0)
         spread_t = quantile_result.spread_t_stat.get(period, 0)
         spread_p = quantile_result.spread_p_value.get(period, 1)
-        monotonic = quantile_result.is_monotonic.get(period, False)
-        direction = quantile_result.monotonicity_direction.get(period, "none")
+        monotonic, direction = quantile_result.get_monotonicity(period)
+        monotonic_display = (
+            "N/A" if monotonic is None else "✓ " + direction if monotonic else "✗ No"
+        )
 
         spread_text = (
             f"<b>Spread Analysis:</b><br>"
             f"Top - Bottom: {format_finite(spread, '.1%')}<br>"
             f"t-stat: {format_finite(spread_t, '.2f')} "
             f"(p={format_finite(spread_p, '.4f')})<br>"
-            f"Monotonic: {'✓ ' + direction if monotonic else '✗ No'}"
+            f"Monotonic: {monotonic_display}"
         )
 
         fig.add_annotation(
@@ -173,22 +179,32 @@ def plot_quantile_returns_bar(
 
 def plot_quantile_returns_violin(
     quantile_result: QuantileAnalysisResult,
-    factor_data: dict | None = None,
+    factor_data: dict | pl.DataFrame | pd.DataFrame | None = None,
     period: str | None = None,
     show_box: bool = True,
     theme: str | None = None,
     width: int | None = None,
     height: int | None = None,
+    *,
+    observations: pl.DataFrame | pd.DataFrame | None = None,
+    ylim_percentiles: tuple[float, float] | None = None,
 ) -> go.Figure:
-    """Plot return distributions by quantile as violin plots.
+    """Plot actual observed-date bucket means, or explicitly supplied return values.
+
+    No normal samples are inferred from summary means/deviations. A result with
+    no empirical observations requires explicit input or raises ValueError.
+    The default result/report path uses dated bucket means, not asset samples.
+    Plotly's KDE rendering is a presentation choice, not a numerical density
+    equivalence claim; callers retain figure bandwidth/style/embedding control.
 
     Parameters
     ----------
     quantile_result : QuantileAnalysisResult
         Quantile analysis result from a signal analysis workflow.
-    factor_data : dict | None
-        Raw factor data dict with 'quantile' and return columns.
-        If None, uses synthetic data from result statistics.
+    factor_data : dict or DataFrame, optional
+        Explicit supplied values with quantile and {period}_fwd_return columns.
+        These values are not reduced to date/bucket means. Null/nonfinite values
+        are omitted, and the sample unit remains supplied_value.
     period : str | None
         Period to plot. If None, uses first period.
     show_box : bool, default True
@@ -199,6 +215,14 @@ def plot_quantile_returns_violin(
         Figure width
     height : int | None
         Figure height
+    observations : DataFrame, optional
+        Canonical by-date compute_quantile_statistics output, with return_column
+        matching the selected period. Shared adjustments/counts are retained.
+        Select one group before plotting grouped statistics. Cannot be combined
+        with factor_data. Otherwise use the result's owned observations.
+    ylim_percentiles : tuple[float, float], optional
+        Ordered percentiles in [0,100] of defined selected-period observations.
+        Sets visible y limits without discarding or modifying trace samples.
 
     Returns
     -------
@@ -208,12 +232,76 @@ def plot_quantile_returns_violin(
     theme = validate_theme(theme)
     theme_config = get_theme_config(theme)
 
-    # Get period data
     periods = quantile_result.periods
+    if not periods:
+        raise ValueError("No return periods are available for empirical plotting")
     if period is None:
         period = periods[0]
     elif period not in periods:
         raise ValueError(f"Period '{period}' not found. Available: {periods}")
+
+    if factor_data is not None and observations is not None:
+        raise ValueError("supply observations or factor_data, not both")
+    from ml4t.diagnostic.signal._utils import _signal_frame
+    from ml4t.diagnostic.signal.quantile import _quantile_observations
+
+    empirical = factor_data is None
+    adjustment = None
+    if empirical:
+        data = (
+            _quantile_observations(observations)
+            if observations is not None
+            else quantile_result.get_dataframe("observations")
+        )
+        if "group" in data.columns and data["group"].n_unique() > 1:
+            raise ValueError("select one group before plotting empirical quantile observations")
+        if data.height and period not in data["return_column"].to_list():
+            raise ValueError(f"empirical observations do not contain selected period {period!r}")
+        data = data.filter(pl.col("return_column") == period)
+        methods = data["return_adjustment"].unique().to_list()
+        if len(methods) > 1:
+            raise ValueError("selected observations mix return-adjustment methods")
+        adjustment = methods[0] if methods else None
+        value_column = "mean"
+    else:
+        data = _signal_frame(
+            pl.DataFrame(factor_data) if isinstance(factor_data, dict) else factor_data
+        )
+        value_column = f"{period}_fwd_return"
+        if not {"quantile", value_column}.issubset(data.columns):
+            raise ValueError(f"supplied return values require quantile and {value_column} columns")
+    if not data["quantile"].dtype.is_numeric():
+        raise TypeError("supplied quantile labels must be numeric positive integers")
+    buckets = data["quantile"]
+    if (
+        buckets.null_count()
+        or not buckets.is_finite().all()
+        or not ((buckets >= 1) & (buckets == buckets.floor())).all()
+    ):
+        raise ValueError("supplied quantile labels must be positive integers")
+    if set(buckets.to_list()).difference(range(1, quantile_result.n_quantiles + 1)):
+        raise ValueError("observed buckets are not represented by the result's quantile labels")
+    if not (data[value_column].dtype.is_numeric() or data[value_column].dtype == pl.Null):
+        raise TypeError("supplied return observations must be numeric")
+    data = data.with_columns(pl.col(value_column).cast(pl.Float64)).filter(
+        pl.col(value_column).is_finite()
+    )
+    limits = None
+    if ylim_percentiles is not None:
+        try:
+            percentiles = tuple(ylim_percentiles)
+        except TypeError as exc:
+            raise ValueError(
+                "ylim_percentiles must contain two ordered percentiles in [0,100]"
+            ) from exc
+        if (
+            len(percentiles) != 2
+            or any(isinstance(value, bool) or not isinstance(value, Real) for value in percentiles)
+            or not 0 <= percentiles[0] <= percentiles[1] <= 100
+        ):
+            raise ValueError("ylim_percentiles must contain two ordered percentiles in [0,100]")
+        if data.height:
+            limits = np.percentile(data[value_column].to_numpy(), percentiles).tolist()
 
     n_quantiles = quantile_result.n_quantiles
     quantile_labels = quantile_result.quantile_labels
@@ -221,69 +309,54 @@ def plot_quantile_returns_violin(
 
     # Create figure
     fig = create_base_figure(
-        title=f"Return Distribution by Quantile ({period})",
+        title=f"{'Observed quantile means' if empirical else 'Supplied quantile returns'} ({period})",
         xaxis_title="Quantile",
-        yaxis_title="Forward Return",
+        yaxis_title="Date/bucket mean return" if empirical else "Supplied return",
         width=width or theme_config["defaults"]["bar_height"] + 200,
         height=height or theme_config["defaults"]["bar_height"],
         theme=theme,
     )
 
-    # If we have raw data, use it; otherwise generate synthetic
-    if factor_data is not None and "quantile" in factor_data:
-        import polars as pl
-
-        if isinstance(factor_data, pl.DataFrame):
-            # Extract return column for this period
-            return_col = period.replace("D", "D_fwd_return")
-            for i, q_label in enumerate(quantile_labels):
-                q_num = i + 1
-                q_data = factor_data.filter(pl.col("quantile") == q_num)
-                returns = q_data[return_col].to_numpy()
-                returns = returns[~np.isnan(returns)]
-
-                fig.add_trace(
-                    go.Violin(
-                        y=returns,
-                        name=q_label,
-                        box_visible=show_box,
-                        meanline_visible=True,
-                        fillcolor=colors[i],
-                        line_color=colors[i],
-                        opacity=0.6,
-                    )
-                )
-    else:
-        # Generate synthetic violin data from mean/std
-        # This is approximate but useful when raw data isn't available
-        mean_returns = quantile_result.mean_returns[period]
-        std_returns = quantile_result.std_returns[period]
-        counts = quantile_result.count_by_quantile
-
-        for i, q_label in enumerate(quantile_labels):
-            mean = mean_returns.get(q_label, 0)
-            std = std_returns.get(q_label, 0.01)
-            n = counts.get(q_label, 100)
-
-            # Generate synthetic sample
-            np.random.seed(42 + i)  # Reproducible
-            if not np.isfinite(mean) or n <= 0:
-                synthetic = np.array([], dtype=float)
-            else:
-                finite_std = std if np.isfinite(std) else 0.01
-                synthetic = np.random.normal(mean, finite_std, min(n, 1000))
-
-            fig.add_trace(
-                go.Violin(
-                    y=synthetic,
-                    name=q_label,
-                    box_visible=show_box,
-                    meanline_visible=True,
-                    fillcolor=colors[i],
-                    line_color=colors[i],
-                    opacity=0.6,
+    for i, q_label in enumerate(quantile_labels):
+        sample = data.filter(pl.col("quantile") == i + 1)
+        custom = None
+        if empirical:
+            sample = sample.sort("date")
+            custom = list(
+                zip(
+                    sample["date"].to_pandas().astype(str).to_list(),
+                    sample["n_obs"].to_list(),
+                    strict=True,
                 )
             )
+        fig.add_trace(
+            go.Violin(
+                y=sample[value_column].to_numpy(),
+                name=q_label,
+                customdata=custom,
+                hovertemplate="Date: %{customdata[0]}<br>Mean: %{y:.4%}<br>Assets: %{customdata[1]}<extra>%{fullData.name}</extra>"
+                if empirical
+                else None,
+                box_visible=show_box,
+                meanline_visible=True,
+                spanmode="hard",
+                fillcolor=colors[i],
+                line_color=colors[i],
+                opacity=0.6,
+            )
+        )
+    if data.is_empty():
+        fig.add_annotation(text="No defined empirical observations", showarrow=False)
+    fig.update_layout(
+        meta={
+            "sample_unit": "date_bucket_mean" if empirical else "supplied_value",
+            "return_unit": "decimal",
+            "synthetic": False,
+            "return_adjustment": adjustment,
+        }
+    )
+    if limits is not None:
+        fig.update_yaxes(range=limits)
 
     # Zero line
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
@@ -440,25 +513,50 @@ def plot_spread_timeseries(
     theme: str | None = None,
     width: int | None = None,
     height: int | None = None,
+    *,
+    observations: pl.DataFrame | pd.DataFrame | None = None,
+    upper_quantile: int | None = None,
+    lower_quantile: int = 1,
+    bandwidth: float = 1.0,
 ) -> go.Figure:
-    """Plot top-bottom spread over time with rolling statistics.
+    """Plot actual dated bucket-mean differences and propagated sample errors.
+
+    Reuse compute_quantile_spread on retained or explicitly supplied canonical
+    by-date statistics. No returns are reconstructed from cumulative increments
+    or pooled summaries. Missing empirical data requires explicit observations.
+    Grouped statistics require one group selected before plotting.
+
+    The raw +1 upper / -1 lower mean difference has gross-two exposure, not a
+    unit-gross portfolio return. Optional bands are bandwidth times independent
+    propagated standard error, not inferred confidence coverage or rolling sample
+    deviation. Undefined errors remain unavailable. The existing pooled Student
+    statistics on quantile_result are not substituted for this dated sample.
 
     Parameters
     ----------
     quantile_result : QuantileAnalysisResult
-        Quantile analysis result with cumulative_returns computed.
+        Result with actual dated quantile observations.
     period : str | None
         Period to plot. If None, uses first period.
     rolling_window : int, default 21
-        Window for rolling mean/std calculation
+        Number of observations for a complete-window moving mean, not sessions.
     show_confidence : bool, default True
-        Show confidence band around rolling mean
+        Show propagated standard-error bands around the observed spread. The
+        historical argument name does not establish a confidence level.
     theme : str | None
         Plot theme
     width : int | None
         Figure width
     height : int | None
         Figure height
+    observations : DataFrame, optional
+        Explicit canonical by-date compute_quantile_statistics output. Its
+        return_column matches period, with shared adjustment and asset counts.
+    upper_quantile, lower_quantile : int, optional
+        Positive bucket selectors. Upper defaults to the result's top bucket;
+        the automatic top/bottom path requires at least two buckets.
+    bandwidth : float
+        Finite nonnegative multiplier of actual propagated standard errors.
 
     Returns
     -------
@@ -468,86 +566,92 @@ def plot_spread_timeseries(
     theme = validate_theme(theme)
     theme_config = get_theme_config(theme)
 
-    # Check for cumulative returns
-    if quantile_result.cumulative_returns is None:
-        raise ValueError(
-            "Cumulative returns not computed. Set cumulative_returns=True in SignalConfig."
-        )
+    import pandas as pd
 
-    # Get period data
+    from ml4t.diagnostic.signal._prepared import positive_count
+    from ml4t.diagnostic.signal.quantile import _quantile_observations, compute_quantile_spread
+
+    window = positive_count(rolling_window, "rolling_window")
+    if not isinstance(show_confidence, bool | np.bool_):
+        raise ValueError("show_confidence must be boolean")
+    if (
+        isinstance(bandwidth, bool)
+        or not isinstance(bandwidth, Real)
+        or not np.isfinite(bandwidth)
+        or bandwidth < 0
+    ):
+        raise ValueError("bandwidth must be a finite nonnegative real multiplier")
     periods = quantile_result.periods
+    if not periods:
+        raise ValueError("No return periods are available for empirical spread plotting")
     if period is None:
         period = periods[0]
     elif period not in periods:
         raise ValueError(f"Period '{period}' not found. Available: {periods}")
 
-    quantile_labels = quantile_result.quantile_labels
-    cum_returns = quantile_result.cumulative_returns[period]
-    dates_raw = quantile_result.cumulative_dates
-
-    # Convert dates or create fallback indices
-    if dates_raw is not None and len(dates_raw) > 0:
-        if isinstance(dates_raw[0], str):
-            try:
-                dates: list[Any] = [datetime.fromisoformat(d) for d in dates_raw]
-            except ValueError:
-                dates = list(dates_raw)
-        else:
-            dates = list(dates_raw)
+    if upper_quantile is None and quantile_result.n_quantiles < 2:
+        raise ValueError("automatic spread plotting requires at least two quantile buckets")
+    values = (
+        _quantile_observations(observations)
+        if observations is not None
+        else quantile_result.get_dataframe("observations")
+    )
+    if values.height and period not in values["return_column"].to_list():
+        raise ValueError(f"empirical observations do not contain selected period {period!r}")
+    values = values.filter(pl.col("return_column") == period)
+    if "group" in values.columns and values["group"].n_unique() > 1:
+        raise ValueError("select one group before plotting empirical spread observations")
+    methods = values["return_adjustment"].unique().to_list()
+    if len(methods) > 1:
+        raise ValueError("selected observations mix return-adjustment methods")
+    spread_data = compute_quantile_spread(
+        values,
+        upper_quantile=quantile_result.n_quantiles if upper_quantile is None else upper_quantile,
+        lower_quantile=lower_quantile,
+        include_standard_error=bool(show_confidence),
+    ).sort("date")
+    spread = spread_data["spread"].cast(pl.Float64).to_numpy()
+    errors = spread_data["standard_error"].cast(pl.Float64).to_numpy()
+    if spread_data["date"].dtype.is_temporal():
+        timestamps = [pd.Timestamp(value) for value in spread_data["date"].to_pandas()]
+        dates = [value.isoformat() for value in timestamps]
+        categories = any(value.value % 1_000_000 for value in timestamps)
     else:
-        # Fallback to integer indices if no dates provided
-        max_len = max(len(v) for v in cum_returns.values()) if cum_returns else 0
-        dates = list(range(max_len))
-
-    # Compute daily spread (difference in daily returns)
-    top_cum = np.array(cum_returns.get(quantile_labels[-1], []))
-    bottom_cum = np.array(cum_returns.get(quantile_labels[0], []))
-
-    if len(top_cum) < 2 or len(bottom_cum) < 2:
-        raise ValueError("Insufficient data for spread calculation")
-
-    min_len = min(len(top_cum), len(bottom_cum))
-    top_cum = top_cum[:min_len]
-    bottom_cum = bottom_cum[:min_len]
-    dates = dates[:min_len]
-
-    # Daily returns from cumulative
-    top_daily = np.diff(top_cum, prepend=0)
-    bottom_daily = np.diff(bottom_cum, prepend=0)
-    spread_daily = top_daily - bottom_daily
-
-    # Rolling statistics
-    rolling_mean = np.full_like(spread_daily, np.nan)
-    rolling_std = np.full_like(spread_daily, np.nan)
-
-    for i in range(rolling_window - 1, len(spread_daily)):
-        window = spread_daily[i - rolling_window + 1 : i + 1]
-        rolling_mean[i] = np.mean(window)
-        rolling_std[i] = np.std(window, ddof=1)
+        dates = [str(value) for value in spread_data["date"]]
+        categories = True
+    customdata = list(
+        zip(
+            dates,
+            spread_data["upper_n_obs"].to_list(),
+            spread_data["lower_n_obs"].to_list(),
+            strict=True,
+        )
+    )
+    rolling_mean = pd.Series(spread).rolling(window, min_periods=window).mean().to_numpy()
 
     # Create figure
     fig = create_base_figure(
-        title=f"Spread Time Series ({period}) - Top vs Bottom Quantile",
-        xaxis_title="Date",
-        yaxis_title="Daily Spread Return",
+        title=f"Observed Quantile Spread ({period})",
+        xaxis_title="Observed date order" if categories else "Date",
+        yaxis_title="Upper - lower mean return",
         width=width or theme_config["defaults"]["line_height"] + 300,
         height=height or theme_config["defaults"]["line_height"],
         theme=theme,
     )
 
-    # Daily spread scatter
     fig.add_trace(
         go.Scatter(
             x=dates,
-            y=spread_daily,
-            mode="markers",
-            name="Daily Spread",
+            y=spread,
+            customdata=customdata,
+            mode="lines+markers",
+            name="Observed Spread",
             marker={
                 "size": 4,
                 "color": theme_config["colorway"][0],
                 "opacity": 0.4,
             },
-            hovertemplate="Date: %{x}<br>Spread: %{y:.4f}<extra></extra>",
+            hovertemplate="Date: %{customdata[0]}<br>Spread: %{y:.4%}<br>Upper assets: %{customdata[1]}<br>Lower assets: %{customdata[2]}<extra></extra>",
         )
     )
 
@@ -557,26 +661,26 @@ def plot_spread_timeseries(
             x=dates,
             y=rolling_mean,
             mode="lines",
-            name=f"{rolling_window}-Day Rolling Mean",
+            name=f"{window}-Observation Rolling Mean",
             line={"color": theme_config["colorway"][1], "width": 2},
             hovertemplate="Date: %{x}<br>Rolling Mean: %{y:.4f}<extra></extra>",
         )
     )
 
-    # Confidence band
     if show_confidence:
-        upper = rolling_mean + 1.96 * rolling_std
-        lower = rolling_mean - 1.96 * rolling_std
+        upper = spread + bandwidth * errors
+        lower = spread - bandwidth * errors
 
         fig.add_trace(
             go.Scatter(
                 x=list(dates) + list(reversed(dates)),
                 y=list(upper) + list(reversed(lower)),
+                mode="lines",
                 fill="toself",
                 fillcolor="rgba(128, 128, 128, 0.2)",
                 line={"width": 0},
                 showlegend=True,
-                name="95% CI",
+                name="Propagated SE band",
                 hoverinfo="skip",
             )
         )
@@ -584,17 +688,13 @@ def plot_spread_timeseries(
     # Zero line
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
 
-    # Summary statistics
-    mean_spread = quantile_result.spread_mean.get(period, 0)
-    t_stat = quantile_result.spread_t_stat.get(period, 0)
-    p_value = quantile_result.spread_p_value.get(period, 1)
-
-    summary_text = (
-        f"<b>Spread Statistics:</b><br>"
-        f"Mean: {format_finite(mean_spread, '.1%')}<br>"
-        f"t-stat: {format_finite(t_stat, '.2f')}<br>"
-        f"p-value: {format_finite(p_value, '.4f')}"
-    )
+    summary_text = f"Raw +1 upper / -1 lower (gross two)<br>Defined observed pairs: {int(np.isfinite(spread).sum())}"
+    if show_confidence:
+        summary_text += f"<br>Band: {bandwidth:g} × independent propagated SE"
+        if not np.isfinite(errors).all():
+            summary_text += "<br>Some propagated errors unavailable"
+    if not np.isfinite(spread).any():
+        summary_text += "<br>No defined observed spread"
 
     fig.add_annotation(
         text=summary_text,
@@ -611,5 +711,27 @@ def plot_spread_timeseries(
 
     # Format y-axis
     fig.update_yaxes(tickformat=".2%")
+    if categories:
+        fig.update_xaxes(
+            type="category",
+            tickmode="array",
+            tickvals=dates,
+            ticktext=[str(index + 1) for index in range(len(dates))],
+        )
+    fig.update_layout(
+        showlegend=True,
+        legend={"orientation": "h", "x": 0, "y": -0.2},
+        meta={
+            "return_unit": "decimal",
+            "sample_unit": "date_bucket_mean_difference",
+            "exposure_convention": "long_upper_short_lower_unit_each",
+            "error_method": "independent_propagation" if show_confidence else "unavailable",
+            "bandwidth": float(bandwidth),
+            "rolling_window_observations": window,
+            "return_adjustment": methods[0] if methods else None,
+            "x_clock": "observation_order" if categories else "dated",
+            "timestamp_keys": dates,
+        },
+    )
 
     return fig

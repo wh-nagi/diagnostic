@@ -19,18 +19,29 @@ Example:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from copy import deepcopy
+from inspect import signature
+from numbers import Integral, Real
+from typing import TYPE_CHECKING, Literal, Union
 
 import numpy as np
 import polars as pl
 from scipy import stats
 
 from ml4t.diagnostic.metrics import sharpe_ratio, sortino_ratio
+from ml4t.diagnostic.metrics.risk_adjusted import _drawdown_from_wealth
 
+from .holdings import HoldingsAnalysisResult, analyze_holdings, position_snapshot
+from .holdings_sectors import SectorMapping, analyze_sector_exposures
+from .inputs import (
+    annual_risk_free,
+    initial_valuation_time,
+    normalize_observations,
+    positive_integer,
+)
 from .metrics import (
     _safe_cumprod,
     _safe_prod,
-    _to_numpy,
     alpha_beta,
     annual_return,
     annual_volatility,
@@ -53,10 +64,12 @@ from .results import (
 )
 
 if TYPE_CHECKING:
+    from datetime import date, datetime
+
     import pandas as pd
 
 # Type aliases - use Union for Python 3.9 compatibility
-ArrayLike = Union[np.ndarray, pl.Series, "list[float]"]
+ArrayLike = Union[np.ndarray, pl.Series, "pd.Series", "list[float]"]
 DataFrameLike = Union[pl.DataFrame, "pd.DataFrame"]
 
 
@@ -85,6 +98,22 @@ class PortfolioAnalysis:
         Annual risk-free rate for Sharpe/Sortino calculation.
     periods_per_year : int, default 252
         Trading periods per year (252 for daily data).
+    dates : date-like sequence, optional
+        Unique increasing dates, inferred from a pandas DatetimeIndex when present.
+        Explicit dates must agree with that index. Without dates, numerical and
+        rolling outputs use zero-based observation indices; calendar tables and
+        complete calendar dashboards require genuine dates.
+    initial_timestamp : datetime or date, optional
+        Time of the initial valuation, before the first dated return. If omitted,
+        a drawdown starting at initial capital has an unavailable peak timestamp.
+
+    Notes
+    -----
+    Inputs are owned snapshots of nonempty, one-dimensional, finite simple returns
+    no lower than -1. Missing returns are rejected, not replaced with zeros.
+    Dated benchmarks are aligned to every strategy observation without filling;
+    extra benchmark dates are excluded. Undated benchmarks must match in length.
+    Public arrays and cached results are returned as independent copies.
 
     Examples
     --------
@@ -118,45 +147,31 @@ class PortfolioAnalysis:
         benchmark: ArrayLike | pl.Series | None = None,
         positions: DataFrameLike | None = None,
         transactions: DataFrameLike | None = None,
-        dates: ArrayLike | pl.Series | None = None,
+        dates: pl.Series | np.ndarray | pd.DatetimeIndex | list[date | datetime] | None = None,
         risk_free: float = 0.0,
         periods_per_year: int = 252,
+        *,
+        initial_timestamp: date | datetime | None = None,
     ):
-        # Convert returns to numpy
-        self._returns = _to_numpy(returns)
-
-        # Handle dates
-        if dates is not None:
-            if isinstance(dates, pl.Series):
-                self._dates = dates
-            else:
-                self._dates = pl.Series("date", dates)
-        else:
-            # Generate synthetic dates
-            self._dates = pl.Series(
-                "date",
-                pl.date_range(
-                    pl.date(2000, 1, 1),
-                    pl.date(2000, 1, 1) + pl.duration(days=len(self._returns) - 1),
-                    eager=True,
-                ),
-            )
-
-        # Convert benchmark if provided
-        self._benchmark = _to_numpy(benchmark) if benchmark is not None else None
-
-        # Store positions and transactions (convert to Polars if needed)
-        self._positions = self._to_polars_df(positions) if positions is not None else None
+        scale = positive_integer(periods_per_year, "periods_per_year")
+        annual_rf = annual_risk_free(risk_free)
+        owned_returns, owned_benchmark, owned_dates = normalize_observations(
+            returns, benchmark, dates
+        )
+        self._returns = owned_returns
+        self._benchmark = owned_benchmark
+        self._dates = owned_dates
+        self._initial_timestamp = initial_valuation_time(initial_timestamp, owned_dates)
+        self._positions = position_snapshot(positions) if positions is not None else None
         self._transactions = self._to_polars_df(transactions) if transactions is not None else None
 
-        # Configuration
-        self._risk_free = risk_free
-        self._periods_per_year = periods_per_year
+        self._risk_free = annual_rf
+        self._periods_per_year = scale
 
         # Cached results
         self._metrics_cache: PortfolioMetrics | None = None
         self._rolling_cache: dict[tuple, RollingMetricsResult] = {}
-        self._drawdown_cache: DrawdownResult | None = None
+        self._drawdown_cache: dict[tuple[int, float], DrawdownResult] = {}
 
     @staticmethod
     def _to_polars_df(df: DataFrameLike | None) -> pl.DataFrame | None:
@@ -164,24 +179,36 @@ class PortfolioAnalysis:
         if df is None:
             return None
         if isinstance(df, pl.DataFrame):
-            return df
+            return df.clone()
         # Assume pandas DataFrame
         return pl.from_pandas(df)
 
     @property
     def returns(self) -> np.ndarray:
-        """Get returns as numpy array."""
-        return self._returns
+        """Get an independent copy of the strategy return snapshot."""
+        return self._returns.copy()
 
     @property
     def dates(self) -> pl.Series:
-        """Get dates as Polars Series."""
-        return self._dates
+        """Get dates or, for undated input, zero-based observation indices."""
+        return self._dates.clone()
+
+    @property
+    def has_dates(self) -> bool:
+        """Whether actual dates were supplied or retained from labeled returns."""
+        return self._dates.dtype.is_temporal()
+
+    def require_dates(self) -> None:
+        """Reject calendar-based outputs when only observation order is known."""
+        if not self.has_dates:
+            raise ValueError(
+                "dates are required for calendar tables and complete portfolio reports"
+            )
 
     @property
     def benchmark(self) -> np.ndarray | None:
-        """Get benchmark returns as numpy array."""
-        return self._benchmark
+        """Get an independent copy of the aligned benchmark snapshot."""
+        return self._benchmark.copy() if self._benchmark is not None else None
 
     @property
     def has_benchmark(self) -> bool:
@@ -198,6 +225,49 @@ class PortfolioAnalysis:
         """Check if transactions data was provided."""
         return self._transactions is not None
 
+    def compute_holdings_analysis(
+        self,
+        valuations: DataFrameLike,
+        *,
+        complete_snapshots: bool,
+        snapshot_kind: Literal["observed", "end_of_day", "intraday"] = "observed",
+        sector_mapping: SectorMapping | None = None,
+    ) -> HoldingsAnalysisResult:
+        """Analyze complete holdings on exact supplied return observation keys.
+
+        Positions are signed market values in long date/asset/value format or
+        wide string asset columns. Pandas DatetimeIndex labels are retained.
+        Valuations supply date and optional reported equity/cash, in the same
+        currency as holdings. Missing NAV leaves NAV ratios unavailable; NAV is
+        never inferred from cash plus holdings. Missing position marks fail.
+
+        Explicit completeness declares absent assets zero within a snapshot;
+        every observation still requires a dated snapshot. No calendar grouping,
+        forward fill, intraday reconstruction or instrument valuation is done.
+        Snapshot kind is caller-declared provenance, not an inferred schedule.
+        The result and its tables are independent of inputs and previous calls.
+
+        Optional sector_mapping accepts a static mapping/Series or asset/sector
+        table with optional exact date keys. Unknown labels remain a null-sector
+        group. Dated labels are not filled between observations. Account cash
+        stays in timeline, separate from any sector literally named "cash".
+        """
+        self.require_dates()
+        if self._positions is None:
+            raise ValueError("positions are required for holdings analysis")
+        result = analyze_holdings(
+            self._positions,
+            valuations,
+            self._dates,
+            complete_snapshots=complete_snapshots,
+            snapshot_kind=snapshot_kind,
+        )
+        if sector_mapping is not None:
+            result.positions, result.sectors = analyze_sector_exposures(
+                result.positions, result.timeline, sector_mapping
+            )
+        return result
+
     # =========================================================================
     # Core Metric Methods
     # =========================================================================
@@ -205,8 +275,12 @@ class PortfolioAnalysis:
     def compute_summary_stats(self, force_recompute: bool = False) -> PortfolioMetrics:
         """Compute all standard portfolio metrics.
 
-        This is the main method for getting performance statistics,
-        equivalent to pyfolio's perf_stats output.
+        This is the main method for return-based performance statistics.
+        Match each metric's definition and input conventions before comparison.
+
+        Profit factor uses positive and negative period-return sums, without
+        annualization. No gains or losses yields NaN; gains without losses
+        yields infinity. It does not use trade-lifecycle cash PnL.
 
         Parameters
         ----------
@@ -225,7 +299,7 @@ class PortfolioAnalysis:
         >>> print(f"Max Drawdown: {metrics.max_drawdown:.1%}")
         """
         if self._metrics_cache is not None and not force_recompute:
-            return self._metrics_cache
+            return deepcopy(self._metrics_cache)
 
         returns = self._returns
         rf = self._risk_free
@@ -234,7 +308,7 @@ class PortfolioAnalysis:
         # Basic returns
         total_ret = float(_safe_prod(1 + returns) - 1)
         ann_ret = annual_return(returns, ppy)
-        ann_vol = annual_volatility(returns, ppy)
+        ann_vol = annual_volatility(returns, ppy) if len(returns) > 1 else np.nan
 
         # Risk-adjusted
         sr = sharpe_ratio(returns, rf, ppy)
@@ -247,8 +321,9 @@ class PortfolioAnalysis:
         max_dd = max_drawdown(returns)
 
         # Distribution
-        skew = float(stats.skew(returns[~np.isnan(returns)]))
-        kurt = float(stats.kurtosis(returns[~np.isnan(returns)]))
+        has_dispersion = len(returns) > 1 and np.ptp(returns) > 0
+        skew = float(stats.skew(returns)) if has_dispersion else np.nan
+        kurt = float(stats.kurtosis(returns)) if has_dispersion else np.nan
 
         # Risk
         var95 = value_at_risk(returns, 0.95)
@@ -267,7 +342,12 @@ class PortfolioAnalysis:
 
         gross_profit = float(np.sum(wins)) if len(wins) > 0 else 0.0
         gross_loss = float(abs(np.sum(losses))) if len(losses) > 0 else 0.0
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = np.inf
+        else:
+            profit_factor = np.nan
 
         # Benchmark metrics
         alpha_val = beta_val = ir = up_cap = down_cap = None
@@ -303,7 +383,7 @@ class PortfolioAnalysis:
             down_capture=down_cap,
         )
 
-        return self._metrics_cache
+        return deepcopy(self._metrics_cache)
 
     def compute_rolling_metrics(
         self,
@@ -335,15 +415,25 @@ class PortfolioAnalysis:
         if metrics is None:
             metrics = ["sharpe", "volatility", "returns"]
 
+        if not windows:
+            raise ValueError("windows must contain positive integer observation counts")
+        windows = [positive_integer(window, "windows") for window in windows]
+        if not metrics or any(
+            metric not in {"sharpe", "volatility", "returns", "beta"} for metric in metrics
+        ):
+            raise ValueError("metrics must contain sharpe, volatility, returns or beta")
+        if "beta" in metrics and not self.has_benchmark:
+            raise ValueError("metrics beta requires a benchmark")
+
         cache_key = (tuple(windows), tuple(metrics))
         if cache_key in self._rolling_cache:
-            return self._rolling_cache[cache_key]
+            return deepcopy(self._rolling_cache[cache_key])
 
         returns = self._returns
         rf = self._risk_free
         ppy = self._periods_per_year
 
-        result = RollingMetricsResult(windows=windows, dates=self._dates)
+        result = RollingMetricsResult(windows=windows, dates=self._dates.clone())
 
         for window in windows:
             if "sharpe" in metrics:
@@ -365,7 +455,7 @@ class PortfolioAnalysis:
                 result.beta[window] = pl.Series(f"beta_{window}d", rolling_beta).fill_nan(None)
 
         self._rolling_cache[cache_key] = result
-        return result
+        return deepcopy(result)
 
     @staticmethod
     def _rolling_sharpe(
@@ -380,7 +470,7 @@ class PortfolioAnalysis:
         n = len(returns)
         result = np.full(n, np.nan)
 
-        if n < window:
+        if n < window or window < 2:
             return result
 
         daily_rf = (1 + risk_free) ** (1 / periods_per_year) - 1
@@ -394,7 +484,9 @@ class PortfolioAnalysis:
         sd = np.std(excess, axis=1, ddof=1)
 
         # Sharpe where std > 0
-        sharpe = np.where(sd > 0, (mu / sd) * np.sqrt(periods_per_year), np.nan)
+        sharpe = np.full(len(mu), np.nan)
+        np.divide(mu, sd, out=sharpe, where=sd > 0)
+        sharpe *= np.sqrt(periods_per_year)
         result[window - 1 :] = sharpe
 
         return result
@@ -411,7 +503,7 @@ class PortfolioAnalysis:
         n = len(returns)
         result = np.full(n, np.nan)
 
-        if n < window:
+        if n < window or window < 2:
             return result
 
         # Vectorized: create all windows at once
@@ -426,23 +518,23 @@ class PortfolioAnalysis:
         returns: np.ndarray,
         window: int,
     ) -> np.ndarray:
-        """Compute rolling cumulative returns using O(n) log1p cumsum."""
+        """Compound rolling returns in O(n), retaining exact total-loss observations."""
         n = len(returns)
         result = np.full(n, np.nan)
 
         if n < window:
             return result
 
-        # Vectorized O(n): use log1p cumsum for compound returns
-        # Requires returns > -1 (valid for typical financial returns)
-        # Clip to prevent log of non-positive numbers
-        safe_returns = np.clip(returns, -0.9999, None)
-        log_returns = np.log1p(safe_returns)
+        total_loss = returns == -1
+        log_returns = np.zeros_like(returns)
+        np.log1p(returns, out=log_returns, where=~total_loss)
         cumsum = np.concatenate(([0.0], np.cumsum(log_returns)))
-
-        # Rolling sum of log returns = log(compound return + 1)
+        loss_counts = np.concatenate(([0], np.cumsum(total_loss)))
         window_log_sum = cumsum[window:] - cumsum[:-window]
-        result[window - 1 :] = np.expm1(window_log_sum)
+        has_loss = loss_counts[window:] > loss_counts[:-window]
+        compounded = np.full(len(window_log_sum), -1.0)
+        np.expm1(window_log_sum, out=compounded, where=~has_loss)
+        result[window - 1 :] = compounded
 
         return result
 
@@ -458,7 +550,7 @@ class PortfolioAnalysis:
         n = len(returns)
         result = np.full(n, np.nan)
 
-        if n < window:
+        if n < window or window < 2:
             return result
 
         # Vectorized: create all windows at once
@@ -478,7 +570,8 @@ class PortfolioAnalysis:
         var = np.sum(bench_dev * bench_dev, axis=1) / (window - 1)
 
         # Beta = cov / var where var > 0
-        beta = np.where(var > 0, cov / var, np.nan)
+        beta = np.full(len(cov), np.nan)
+        np.divide(cov, var, out=beta, where=var > 0)
         result[window - 1 :] = beta
 
         return result
@@ -493,9 +586,11 @@ class PortfolioAnalysis:
         Parameters
         ----------
         top_n : int, default 5
-            Number of top drawdowns to identify
+            Nonnegative number of top drawdowns to select. Zero returns only the
+            aggregate statistics; it does not change the total episode count.
         threshold : float, default 0.01
-            Minimum drawdown depth to count (1%)
+            Finite minimum absolute depth in [0, 1]. Episodes strictly deeper
+            than this threshold are counted. Does not change the underwater curve.
 
         Returns
         -------
@@ -506,20 +601,28 @@ class PortfolioAnalysis:
         --------
         >>> dd = analysis.compute_drawdown_analysis(top_n=10)
         >>> print(f"Max drawdown: {dd.max_drawdown:.1%}")
-        >>> print(f"Avg duration: {dd.avg_duration_days:.0f} days")
+        >>> print(f"Avg duration: {dd.avg_duration_days:.0f} observations")
         """
-        if self._drawdown_cache is not None:
-            return self._drawdown_cache
+        if isinstance(top_n, (bool, np.bool_)) or not isinstance(top_n, Integral) or top_n < 0:
+            raise ValueError("top_n must be a nonnegative integer")
+        if (
+            isinstance(threshold, (bool, np.bool_))
+            or not isinstance(threshold, Real)
+            or not np.isfinite(threshold)
+            or not 0 <= threshold <= 1
+        ):
+            raise ValueError("threshold must be a finite real depth in [0, 1]")
+        top_n, threshold = int(top_n), float(threshold)
+        cache_key = (top_n, threshold)
+        if cache_key in self._drawdown_cache:
+            return deepcopy(self._drawdown_cache[cache_key])
 
         returns = self._returns
         dates = self._dates
 
-        # Compute cumulative returns and running max
+        # The initial valuation is a high-water mark, not an extra return observation.
         cum_returns = _safe_cumprod(1 + returns)
-        running_max = np.maximum.accumulate(cum_returns)
-
-        # Underwater curve
-        underwater = (cum_returns - running_max) / running_max
+        underwater = _drawdown_from_wealth(cum_returns)
 
         # Identify drawdown periods
         drawdown_periods = self._identify_drawdown_periods(underwater, dates, threshold)
@@ -541,7 +644,7 @@ class PortfolioAnalysis:
         max_duration = max(durations) if durations else 0
         avg_duration = float(np.mean(durations)) if durations else 0.0
 
-        self._drawdown_cache = DrawdownResult(
+        self._drawdown_cache[cache_key] = DrawdownResult(
             current_drawdown=current_dd,
             max_drawdown=max_dd,
             avg_drawdown=avg_dd,
@@ -553,7 +656,7 @@ class PortfolioAnalysis:
             dates=dates,
         )
 
-        return self._drawdown_cache
+        return deepcopy(self._drawdown_cache[cache_key])
 
     def _identify_drawdown_periods(
         self,
@@ -565,7 +668,7 @@ class PortfolioAnalysis:
         periods = []
 
         in_drawdown = False
-        peak_idx = 0
+        peak_idx = -1
         valley_idx = 0
         valley_depth = 0.0
 
@@ -585,7 +688,7 @@ class PortfolioAnalysis:
                 elif dd >= 0:
                     # Recovery
                     period = DrawdownPeriod(
-                        peak_date=dates[peak_idx],
+                        peak_date=(self._initial_timestamp if peak_idx < 0 else dates[peak_idx]),
                         valley_date=dates[valley_idx],
                         recovery_date=dates[i],
                         depth=valley_depth,
@@ -599,7 +702,7 @@ class PortfolioAnalysis:
         # Handle ongoing drawdown
         if in_drawdown:
             period = DrawdownPeriod(
-                peak_date=dates[peak_idx],
+                peak_date=(self._initial_timestamp if peak_idx < 0 else dates[peak_idx]),
                 valley_date=dates[valley_idx],
                 recovery_date=None,
                 depth=valley_depth,
@@ -664,6 +767,7 @@ class PortfolioAnalysis:
         pl.DataFrame
             Monthly returns with year and month columns
         """
+        self.require_dates()
         df = pl.DataFrame(
             {
                 "date": self._dates,
@@ -694,6 +798,7 @@ class PortfolioAnalysis:
         pl.DataFrame
             Annual returns with year column
         """
+        self.require_dates()
         df = pl.DataFrame(
             {
                 "date": self._dates,
@@ -724,12 +829,13 @@ class PortfolioAnalysis:
             Pivoted DataFrame with years as rows, months as columns
         """
         monthly = self.compute_monthly_returns()
+        pivot_key = "on" if "on" in signature(monthly.pivot).parameters else "columns"
 
         # Pivot to matrix form
         return monthly.pivot(
             values="monthly_return",
             index="year",
-            on="month",
+            **{pivot_key: "month"},
         ).sort("year")
 
     def create_tear_sheet(

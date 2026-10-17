@@ -10,10 +10,13 @@ Lopez de Prado, M. (2018). "Advances in Financial Machine Learning"
 
 from __future__ import annotations
 
+import base64
+import math
+from io import BytesIO
 from typing import Any
 
 import polars as pl
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from ml4t.diagnostic.results.base import BaseResult
 from ml4t.diagnostic.results.signal_results.validation import _normalize_period
@@ -144,10 +147,51 @@ class QuantileAnalysisResult(BaseResult):
         default=None,
         description="Dates for cumulative returns",
     )
+    observations_ipc_base64: str | None = Field(
+        default=None, description="Actual per-date bucket statistics, encoded Arrow IPC/base64"
+    )
+
+    def _observations(self) -> pl.DataFrame:
+        if self.observations_ipc_base64 is None:
+            raise ValueError(
+                "empirical quantile observations are unavailable; supply actual statistics"
+            )
+        try:
+            frame = pl.read_ipc(
+                BytesIO(base64.b64decode(self.observations_ipc_base64, validate=True))
+            )
+        except (ValueError, TypeError, OSError, pl.exceptions.PolarsError) as exc:
+            raise ValueError("invalid empirical quantile Arrow IPC/base64 payload") from exc
+        from ml4t.diagnostic.signal.quantile import _quantile_observations
+
+        return _quantile_observations(frame)
 
     # ==========================================================================
     # Validation
     # ==========================================================================
+
+    @field_validator(
+        "mean_returns",
+        "std_returns",
+        "spread_mean",
+        "spread_std",
+        "spread_t_stat",
+        "spread_p_value",
+        "spread_ci_lower",
+        "spread_ci_upper",
+        "rank_correlation",
+        mode="before",
+    )
+    @classmethod
+    def _restore_numeric_nulls(cls, value: Any) -> Any:
+        """Restore undefined JSON statistics with the SignalResult NaN convention."""
+
+        def restore(item: Any) -> Any:
+            if isinstance(item, dict):
+                return {key: restore(number) for key, number in item.items()}
+            return float("nan") if item is None else item
+
+        return restore(value) if isinstance(value, dict) else value
 
     @model_validator(mode="after")
     def _validate_keys(self) -> QuantileAnalysisResult:
@@ -197,6 +241,8 @@ class QuantileAnalysisResult(BaseResult):
                 f"n_quantiles ({self.n_quantiles}) != len(quantile_labels) ({len(self.quantile_labels)})"
             )
 
+        if self.observations_ipc_base64 is not None:
+            self._observations()
         return self
 
     # ==========================================================================
@@ -219,6 +265,8 @@ class QuantileAnalysisResult(BaseResult):
         pl.DataFrame
             Requested DataFrame
         """
+        if name == "observations":
+            return self._observations()
         if name is None or name == "mean_returns":
             mean_return_rows: list[dict[str, Any]] = []
             for period in self.periods:
@@ -234,6 +282,7 @@ class QuantileAnalysisResult(BaseResult):
             return pl.DataFrame(mean_return_rows)
 
         if name == "spread":
+            monotonicity = [self.get_monotonicity(period) for period in self.periods]
             return pl.DataFrame(
                 {
                     "period": self.periods,
@@ -243,10 +292,10 @@ class QuantileAnalysisResult(BaseResult):
                     "spread_p_value": [self.spread_p_value[p] for p in self.periods],
                     "spread_ci_lower": [self.spread_ci_lower[p] for p in self.periods],
                     "spread_ci_upper": [self.spread_ci_upper[p] for p in self.periods],
-                    "is_monotonic": [self.is_monotonic[p] for p in self.periods],
-                    "monotonicity_direction": [
-                        self.monotonicity_direction[p] for p in self.periods
-                    ],
+                    "is_monotonic": pl.Series(
+                        "is_monotonic", [status for status, _ in monotonicity], dtype=pl.Boolean
+                    ),
+                    "monotonicity_direction": [direction for _, direction in monotonicity],
                     "rank_correlation": [self.rank_correlation[p] for p in self.periods],
                 }
             )
@@ -274,6 +323,8 @@ class QuantileAnalysisResult(BaseResult):
         dfs = ["mean_returns", "spread"]
         if self.cumulative_returns is not None:
             dfs.append("cumulative")
+        if self.observations_ipc_base64 is not None:
+            dfs.append("observations")
         return dfs
 
     def summary(self) -> str:
@@ -299,9 +350,9 @@ class QuantileAnalysisResult(BaseResult):
             lines.append(f"Spread (Top-Bottom): {spread_mean:>10}")
             lines.append(f"Spread t-stat:       {spread_t:>10}")
             lines.append(f"Spread p-value:      {spread_p:>10}")
-            lines.append(
-                f"Monotonic:           {self.is_monotonic[period]} ({self.monotonicity_direction[period]})"
-            )
+            monotonic, direction = self.get_monotonicity(period)
+            display = "N/A (unavailable)" if monotonic is None else f"{monotonic} ({direction})"
+            lines.append(f"Monotonic:           {display}")
             lines.append("")
 
         return "\n".join(lines)
@@ -331,6 +382,27 @@ class QuantileAnalysisResult(BaseResult):
         """
         key = _normalize_period(period)
         return self.mean_returns.get(key, {})
+
+    def get_monotonicity(self, period: int | str) -> tuple[bool | None, str]:
+        """Get a known period's decision and direction, or explicit unavailability.
+
+        A nonfinite rank correlation is unavailable, not a negative decision.
+        The native facade leaves its score undefined below three defined bucket
+        means or with constant means. This accessor does not recalculate that
+        rule or the existing decision threshold. Finite supplied decisions and
+        directions remain unchanged.
+
+        Legacy raw boolean/direction maps retain their saved-model shape. Use
+        this accessor or the spread DataFrame for availability-aware values;
+        they return None/"unavailable" for an undefined score. Unknown periods
+        raise ValueError rather than masquerading as unavailable analysis.
+        """
+        key = _normalize_period(period)
+        if key not in self.periods:
+            raise ValueError(f"Period {key!r} not found. Available: {self.periods}")
+        if not math.isfinite(self.rank_correlation[key]):
+            return None, "unavailable"
+        return self.is_monotonic[key], self.monotonicity_direction[key]
 
     def get_spread(self, period: int | str) -> tuple[float, float, float]:
         """Get spread statistics for a period.

@@ -32,16 +32,31 @@ from ml4t.diagnostic.signal._utils import (
     filter_outliers,
     quantize_factor,
 )
-from ml4t.diagnostic.signal.core import analyze_signal, prepare_data
+from ml4t.diagnostic.signal.core import analyze_prepared_signal, analyze_signal, prepare_data
+from ml4t.diagnostic.signal.panel import PreparedSignalPanel, prepare_signal_panel
+from ml4t.diagnostic.signal.portfolio import (
+    compute_factor_cumulative_returns,
+    compute_factor_returns,
+    compute_factor_weights,
+)
 from ml4t.diagnostic.signal.quantile import (
     compute_quantile_returns,
+    compute_quantile_spread,
+    compute_quantile_statistics,
     compute_spread,
     monotonicity_score,
 )
 from ml4t.diagnostic.signal.result import SignalResult
-from ml4t.diagnostic.signal.signal_ic import compute_ic_summary, extract_signal_ic_series
+from ml4t.diagnostic.signal.returns import demean_signal_returns
+from ml4t.diagnostic.signal.signal_ic import (
+    compute_ic_summary,
+    compute_signal_ic,
+    extract_signal_ic_series,
+)
 from ml4t.diagnostic.signal.turnover import (
     compute_autocorrelation,
+    compute_quantile_turnover,
+    compute_rank_autocorrelation,
     compute_turnover,
     estimate_half_life,
 )
@@ -49,21 +64,33 @@ from ml4t.diagnostic.signal.turnover import (
 __all__ = [
     # Main entry point
     "analyze_signal",
+    "analyze_prepared_signal",
     "SignalResult",
     # Data preparation
     "prepare_data",
+    "prepare_signal_panel",
+    "PreparedSignalPanel",
+    "compute_factor_weights",
+    "compute_factor_returns",
+    "compute_factor_cumulative_returns",
     "filter_outliers",
     "quantize_factor",
     "QuantileMethod",
     # IC functions
     "extract_signal_ic_series",
     "compute_ic_summary",
+    "compute_signal_ic",
+    "demean_signal_returns",
     # Quantile functions
     "compute_quantile_returns",
+    "compute_quantile_statistics",
+    "compute_quantile_spread",
     "compute_spread",
     "monotonicity_score",
     # Turnover functions
     "compute_turnover",
+    "compute_quantile_turnover",
+    "compute_rank_autocorrelation",
     "compute_autocorrelation",
     "estimate_half_life",
 ]

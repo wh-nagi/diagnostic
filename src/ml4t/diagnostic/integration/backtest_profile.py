@@ -73,6 +73,7 @@ class BacktestProfile:
     signals_override: Any = None
     strategy_metadata_override: dict[str, Any] | None = None
     data_sources: dict[str, str] = field(default_factory=dict)
+    annualization_factor: int | None = None
     _performance_cache: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _edge_cache: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _activity_cache: dict[str, Any] | None = field(default=None, init=False, repr=False)
@@ -94,6 +95,8 @@ class BacktestProfile:
     @property
     def periods_per_year(self) -> int:
         """Return annualization factor for the resolved calendar."""
+        if self.annualization_factor is not None:
+            return self.annualization_factor
         return get_annualization_factor(self.resolved_calendar)
 
     @property
@@ -259,7 +262,9 @@ class BacktestProfile:
     def activity(self) -> dict[str, Any]:
         """Return fill and rebalance activity analytics."""
         if self._activity_cache is None:
-            self._activity_cache = compute_activity_metrics(self.fills_df, self.portfolio_state_df)
+            self._activity_cache = compute_activity_metrics(
+                self.fills_df, self.portfolio_state_df, trades_df=self.trades_df
+            )
         return self._activity_cache
 
     @property
@@ -360,6 +365,8 @@ class BacktestProfile:
                 predictions_df=self.predictions_df,
                 signals_df=self.signals_df,
                 quote_coverage_threshold=self.quote_coverage_threshold,
+                occupancy_coverage=self.occupancy["coverage"],
+                activity_coverage=self.activity["coverage"],
             )
         return self._availability_cache
 
@@ -385,7 +392,37 @@ def _build_availability(
     predictions_df: pl.DataFrame,
     signals_df: pl.DataFrame,
     quote_coverage_threshold: float,
+    occupancy_coverage: dict[str, Any] | None = None,
+    activity_coverage: dict[str, Any] | None = None,
 ) -> BacktestAvailability:
+    normalization = (
+        occupancy_coverage
+        if occupancy_coverage is not None
+        else compute_occupancy_metrics(portfolio_state_df)["coverage"]
+    )
+    occupancy_reason = None
+    activity_normalization = (
+        activity_coverage
+        if activity_coverage is not None
+        else compute_activity_metrics(fills_df, portfolio_state_df)["coverage"]
+    )
+    activity_normalization_reason = None
+    if not fills_df.is_empty() and not portfolio_state_df.is_empty():
+        if activity_normalization["status"] != "available":
+            activity_normalization_reason = (
+                "Turnover and cost-drag normalization is defined for "
+                f"{activity_normalization['n_normalized_observations']} of "
+                f"{activity_normalization['n_observations']} observations. "
+                "Nonpositive or unusable equity leaves ratios unavailable; raw fill totals remain."
+            )
+    if portfolio_state_df.is_empty():
+        occupancy_reason = "Occupancy requires portfolio_state."
+    elif normalization["status"] != "available":
+        occupancy_reason = (
+            f"Exposure normalization is defined for {normalization['n_normalized_observations']} "
+            f"of {normalization['n_observations']} snapshots. Nonpositive or unusable equity/exposure "
+            "leaves ratios unavailable; raw dollar exposures and position counts remain available."
+        )
     surfaces = {
         "trades": AvailabilityInfo(
             AvailabilityState.AVAILABLE
@@ -463,8 +500,12 @@ def _build_availability(
             activity_reason = "Turnover and cost-drag series require portfolio_state."
             activity_fallback = "Use fill counts, notional, and rebalance summaries only."
         else:
-            activity_status = AvailabilityState.AVAILABLE
-            activity_reason = None
+            activity_status = (
+                AvailabilityState.AVAILABLE
+                if activity_normalization["status"] == "available"
+                else AvailabilityState.PARTIAL
+            )
+            activity_reason = activity_normalization_reason
 
     attribution_status = AvailabilityState.UNAVAILABLE
     attribution_reason = "Neither trades nor fills are available."
@@ -518,14 +559,18 @@ def _build_availability(
             activity_status,
             activity_reason,
             fallback=activity_fallback,
+            coverage=activity_normalization["normalization_coverage"],
         ),
         "occupancy": AvailabilityInfo(
             (
                 AvailabilityState.AVAILABLE
+                if normalization["status"] == "available"
+                else AvailabilityState.PARTIAL
                 if not portfolio_state_df.is_empty()
                 else AvailabilityState.UNAVAILABLE
             ),
-            None if not portfolio_state_df.is_empty() else "Occupancy requires portfolio_state.",
+            occupancy_reason,
+            coverage=normalization["normalization_coverage"],
         ),
         "attribution": AvailabilityInfo(
             attribution_status,
@@ -556,34 +601,41 @@ def _build_availability(
     }
 
     metrics = {
+        "exposure_normalization": AvailabilityInfo(
+            AvailabilityState(normalization["status"]),
+            occupancy_reason,
+            coverage=normalization["normalization_coverage"],
+        ),
         "turnover": AvailabilityInfo(
             (
-                AvailabilityState.AVAILABLE
+                AvailabilityState(activity_normalization["status"])
                 if not fills_df.is_empty() and not portfolio_state_df.is_empty()
                 else AvailabilityState.UNAVAILABLE
             ),
             (
-                None
+                activity_normalization_reason
                 if not fills_df.is_empty() and not portfolio_state_df.is_empty()
                 else "Turnover requires both fills and portfolio_state."
             ),
+            coverage=activity_normalization["normalization_coverage"],
         ),
         "cost_drag": AvailabilityInfo(
             (
-                AvailabilityState.AVAILABLE
+                AvailabilityState(activity_normalization["status"])
                 if not fills_df.is_empty() and not portfolio_state_df.is_empty()
                 else AvailabilityState.DEGRADED
                 if not fills_df.is_empty()
                 else AvailabilityState.UNAVAILABLE
             ),
             (
-                None
+                activity_normalization_reason
                 if not fills_df.is_empty() and not portfolio_state_df.is_empty()
                 else "Cost drag over time requires portfolio_state."
                 if not fills_df.is_empty()
                 else "Cost drag requires fill rows."
             ),
             fallback="Use total implementation cost only." if not fills_df.is_empty() else None,
+            coverage=activity_normalization["normalization_coverage"],
         ),
         "execution_audit": AvailabilityInfo(
             execution_status,

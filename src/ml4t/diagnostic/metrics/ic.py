@@ -14,6 +14,10 @@ from scipy.stats import spearmanr
 
 from ml4t.diagnostic.backends.adapter import DataFrameAdapter
 from ml4t.diagnostic.metrics.basic import compute_forward_returns
+from ml4t.diagnostic.utils.validation import (
+    _align_datetime_key_resolution,
+    _validate_observation_keys,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -83,9 +87,7 @@ def information_coefficient(
         return np.nan
 
     # Remove NaN pairs
-    valid_mask = ~(np.isnan(pred_array) | np.isnan(ret_array))
-    pred_clean = pred_array[valid_mask]
-    ret_clean = ret_array[valid_mask]
+    pred_clean, ret_clean = _nonmissing_ic_pairs(pred_array, ret_array)
 
     if len(pred_clean) < 2:
         if confidence_intervals:
@@ -185,6 +187,9 @@ def cross_sectional_ic_series(
 
     This function computes the Information Coefficient for each time period
     (typically daily), enabling temporal analysis of prediction quality.
+    Declared observation keys must be unique and nonmissing on both inputs.
+    Only the selected value from each frame participates in the correlation;
+    extra columns and identical prediction/return column names are unambiguous.
     Parameters
     ----------
     predictions : Union[pl.DataFrame, pd.DataFrame]
@@ -239,6 +244,7 @@ def cross_sectional_ic_series(
             join_on.append(entity_col)
         else:
             join_on.extend(entity_col)
+    join_on = list(dict.fromkeys(join_on))
 
     predictions_pl = (
         predictions
@@ -251,8 +257,22 @@ def cross_sectional_ic_series(
         else pl.from_pandas(cast(pd.DataFrame, returns))
     )
 
-    # Merge predictions and returns
-    df = predictions_pl.join(returns_pl, on=join_on, how="inner")
+    _validate_observation_keys(predictions_pl, join_on, "predictions")
+    _validate_observation_keys(returns_pl, join_on, "returns")
+    predictions_pl, returns_pl = _align_datetime_key_resolution(
+        predictions_pl, returns_pl, date_col
+    )
+    prediction_value, return_value = "__ic_prediction", "__ic_return"
+    while prediction_value in join_on:
+        prediction_value = "_" + prediction_value
+    while return_value in join_on:
+        return_value = "_" + return_value
+    df = predictions_pl.select(*join_on, pl.col(pred_col).alias(prediction_value)).join(
+        returns_pl.select(*join_on, pl.col(ret_col).alias(return_value)),
+        on=join_on,
+        how="inner",
+    )
+    pred_col, ret_col = prediction_value, return_value
 
     if method not in ("spearman", "pearson"):
         raise ValueError(f"Unknown method: {method!r}. Use 'spearman' or 'pearson'.")
@@ -362,6 +382,13 @@ def cross_sectional_ic(
     }
 
 
+def _nonmissing_ic_pairs(
+    predictions: "NDArray[Any]", returns: "NDArray[Any]"
+) -> tuple["NDArray[Any]", "NDArray[Any]"]:
+    valid = ~(np.isnan(predictions) | np.isnan(returns))
+    return predictions[valid], returns[valid]
+
+
 def compute_ic_by_horizon(
     predictions: pl.DataFrame | pd.DataFrame,
     prices: pl.DataFrame | pd.DataFrame,
@@ -393,7 +420,8 @@ def compute_ic_by_horizon(
     date_col : str, default "date"
         Column name for dates
     group_col : str | None, default None
-        Column for grouping (e.g., 'symbol')
+        Entity key (e.g., 'symbol'), required for multi-asset panels.
+        None denotes one prediction and price observation per date.
     method : str, default "spearman"
         Correlation method
 
@@ -413,17 +441,36 @@ def compute_ic_by_horizon(
     >>> print(f"1-day IC: {ic_by_horizon[1]:.3f}")
     >>> print(f"5-day IC: {ic_by_horizon[5]:.3f}")
     """
+    values, _ = _ic_by_horizon_with_counts(
+        predictions, prices, horizons, pred_col, price_col, date_col, group_col, method
+    )
+    return values
+
+
+def _ic_by_horizon_with_counts(
+    predictions: pl.DataFrame | pd.DataFrame,
+    prices: pl.DataFrame | pd.DataFrame,
+    horizons: list[int] | None,
+    pred_col: str,
+    price_col: str,
+    date_col: str,
+    group_col: str | None,
+    method: str,
+) -> tuple[dict[int, float], dict[int, int]]:
     output_as_pandas = isinstance(predictions, pd.DataFrame)
     predictions_pl = (
         predictions if isinstance(predictions, pl.DataFrame) else pl.from_pandas(predictions)
     )
     prices_pl = prices if isinstance(prices, pl.DataFrame) else pl.from_pandas(prices)
 
+    keys = [date_col, group_col] if group_col is not None else [date_col]
+    _validate_observation_keys(predictions_pl, keys, "predictions")
+
     # Compute forward returns for all horizons
     if horizons is None:
         horizons = [1, 5, 21]
     prices_with_fwd = compute_forward_returns(
-        prices_pl, periods=horizons, price_col=price_col, group_col=group_col
+        prices_pl, periods=horizons, price_col=price_col, group_col=group_col, date_col=date_col
     )
     prices_with_fwd_pl = (
         prices_with_fwd
@@ -436,12 +483,16 @@ def compute_ic_by_horizon(
     if group_col is not None:
         merge_on.append(group_col)
 
+    predictions_pl, prices_with_fwd_pl = _align_datetime_key_resolution(
+        predictions_pl, prices_with_fwd_pl, date_col
+    )
     df = predictions_pl.join(prices_with_fwd_pl, on=merge_on, how="inner")
     if output_as_pandas:
         df = df.to_pandas()
 
     # Compute IC for each horizon
     ic_results: dict[int, float] = {}
+    counts: dict[int, int] = {}
 
     for horizon in horizons:
         ret_col = f"fwd_ret_{horizon}"
@@ -463,8 +514,9 @@ def compute_ic_by_horizon(
             ic_val = float(ic_result)
 
         ic_results[horizon] = ic_val
+        counts[horizon] = len(_nonmissing_ic_pairs(pred_array, ret_array)[0])
 
-    return ic_results
+    return ic_results, counts
 
 
 def compute_ic_ir(

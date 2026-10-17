@@ -14,7 +14,7 @@ from scipy import stats
 from statsmodels.regression.linear_model import OLS
 from statsmodels.stats.sandwich_covariance import cov_hac
 
-from ml4t.diagnostic.metrics.ic import compute_ic_by_horizon
+from ml4t.diagnostic.metrics.ic import _ic_by_horizon_with_counts
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -57,7 +57,7 @@ def compute_ic_summary_stats(
     ic_clean: NDArray[Any] = ic_values[~np.isnan(ic_values)]
     n = len(ic_clean)
 
-    if n < 2:
+    if n == 0:
         return {
             "mean_ic": np.nan,
             "std_ic": np.nan,
@@ -68,7 +68,7 @@ def compute_ic_summary_stats(
         }
 
     mean_ic = float(np.mean(ic_clean))
-    std_ic = float(np.std(ic_clean, ddof=1))
+    std_ic = float(np.std(ic_clean, ddof=1)) if n > 1 else np.nan
     t_stat = mean_ic / (std_ic / np.sqrt(n)) if std_ic > 0 else np.nan
     p_value = 2 * stats.t.sf(abs(t_stat), df=n - 1) if not np.isnan(t_stat) else np.nan
 
@@ -427,7 +427,8 @@ def compute_ic_decay(
         - decay_rate: exponential decay rate (if estimable)
         - half_life: estimated half-life in days (if estimate_half_life=True)
         - optimal_horizon: horizon with highest IC
-        - n_observations: number of observations per horizon
+        - n_observations: aligned non-NaN prediction/return pairs per horizon.
+          Counts can be positive even when IC is undefined (e.g., constant inputs).
 
     Examples
     --------
@@ -473,8 +474,7 @@ def compute_ic_decay(
     # Ensure horizons are sorted
     horizons = sorted(horizons)
 
-    # Compute IC for each horizon using compute_ic_by_horizon
-    ic_results = compute_ic_by_horizon(
+    ic_by_horizon, n_obs_by_horizon = _ic_by_horizon_with_counts(
         predictions=predictions,
         prices=prices,
         horizons=horizons,
@@ -484,16 +484,6 @@ def compute_ic_decay(
         group_col=group_col,
         method=method,
     )
-
-    # Extract IC values and observation counts
-    ic_by_horizon: dict[int, float] = {}
-    n_obs_by_horizon: dict[int, int] = {}
-
-    for horizon, ic_value in ic_results.items():
-        ic_by_horizon[horizon] = ic_value
-        # Note: compute_ic_by_horizon returns just IC values, not counts
-        # We'll approximate n_obs from the input data
-        n_obs_by_horizon[horizon] = len(predictions)
 
     # Find optimal horizon (highest absolute IC)
     optimal_ic: float

@@ -31,7 +31,7 @@ This library follows semantic versioning. The public API consists of all symbols
 exported in __all__. Breaking changes will only occur in major version bumps.
 """
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 # Sub-modules for advanced usage
 from . import (
@@ -93,7 +93,7 @@ from .metrics import QuantileProfile, quantile_profile
 from .selection import FeatureSelector, SelectionReport
 
 # Signal analysis
-from .signal import SignalResult, analyze_signal
+from .signal import SignalResult, analyze_prepared_signal, analyze_signal
 
 # Visualization (optional - may fail if plotly not installed)
 try:
@@ -125,6 +125,7 @@ __all__ = [
     "SelectionReport",
     # Signal Analysis
     "analyze_signal",
+    "analyze_prepared_signal",
     "SignalResult",
     # Cross-sectional feature profiles
     "QuantileProfile",

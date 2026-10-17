@@ -64,14 +64,113 @@ The package root re-exports the most common classes and configs for interactive 
       show_root_heading: true
       members:
         - analyze_signal
+        - analyze_prepared_signal
+        - prepare_signal_panel
+        - PreparedSignalPanel
         - SignalResult
         - prepare_data
         - extract_signal_ic_series
+        - compute_signal_ic
+        - demean_signal_returns
+        - compute_factor_weights
+        - compute_factor_returns
+        - compute_factor_cumulative_returns
         - compute_ic_summary
         - compute_quantile_returns
+        - compute_quantile_statistics
+        - compute_quantile_spread
+        - compute_quantile_turnover
+        - compute_rank_autocorrelation
         - compute_spread
         - compute_turnover
         - estimate_half_life
+
+### IC report sample selection
+
+`SignalResult.to_ic_result()` retains the common finite IC dates across its
+requested horizons. Its statistics describe that retained sample; original
+per-horizon `SignalResult.ic` and related maps stay unchanged. Use
+`to_ic_result(period=1)` to retain one horizon's full finite IC sample. Empty
+intersections have unavailable statistics; a singleton has a defined mean but
+no sample inference. The IC time-series plot displays `CI unavailable` rather
+than a confidence band when variance is undefined. Required numeric summary fields round-trip JSON nulls as
+NaN without changing optional HAC/RAS fields. See the
+[IC report how-to](../user-guide/migration.md#match-ic-report-statistics-to-selected-dates).
+
+`plot_monthly_ic_heatmap` groups that component's selected observations by each
+timestamp's supplied civil year/month, preserving dimensionless IC means and
+missing cells. It labels observed months, keeps defined zero means visible and
+marks an empty sample unavailable. It does not infer exchange sessions. See the
+[monthly IC how-to](../user-guide/migration.md#inspect-monthly-ic-on-the-selected-sample).
+
+::: ml4t.diagnostic.visualization.signal.plot_monthly_ic_heatmap
+
+### Dated persistence result views
+
+Persistence-enabled signal analyses retain independent dated observation tables
+through `SignalResult.to_turnover_result()` and the tear-sheet bridge. The
+structured result accepts paired dated observations separately from its legacy
+summary-map representation. Views label observation lags explicitly; they do
+not validate a calendar or infer uncertainty or half-life.
+
+::: ml4t.diagnostic.results.signal_results.TurnoverAnalysisResult
+    options:
+      show_root_heading: true
+      members:
+        - from_observations
+        - get_dataframe
+        - list_available_dataframes
+        - summary
+
+For a dated component, the existing membership and rank plot functions select
+an observation `lag` and render actual dated estimates, gaps, counts and
+statuses. The turnover heatmap reduces its recorded bucket/lag observations;
+historical horizon-summary components retain their existing paths. See the
+[dated plotting how-to](../user-guide/migration.md#plot-dated-rank-and-membership-persistence).
+
+::: ml4t.diagnostic.visualization.signal.plot_top_bottom_turnover
+
+::: ml4t.diagnostic.visualization.signal.plot_autocorrelation
+
+::: ml4t.diagnostic.visualization.signal.turnover_plots.plot_turnover_heatmap
+
+### Empirical quantile report observations
+
+Signal analyses retain actual dated bucket means in
+`SignalResult.quantile_observations`. `to_quantile_result()` and the tear-sheet
+bridge preserve an owned observation table through JSON. Historical summary-only
+results cannot reconstruct that sample. Pooled bar summaries remain unchanged.
+See the [empirical quantile how-to](../user-guide/migration.md#plot-empirical-dated-quantile-observations)
+for adjustment, units, missing-data and report limits.
+
+Use `get_monotonicity(period)` for an availability-aware decision and direction.
+An undefined rank correlation yields `(None, "unavailable")`; the `spread`
+DataFrame uses a nullable Boolean, and summaries/charts show `N/A`. Historical
+raw boolean/direction maps keep their serialized shape. The existing native
+minimum of three defined bucket means and finite decision threshold are
+unchanged. See [unavailable monotonicity](../user-guide/migration.md#distinguish-unavailable-monotonicity-from-a-negative-decision).
+
+::: ml4t.diagnostic.visualization.signal.plot_quantile_returns_violin
+    options:
+      show_root_heading: true
+
+`plot_spread_timeseries` consumes those dated means through the shared quantile
+spread/error calculation. Its bands describe independent propagated standard
+error, not confidence coverage; smoothing windows count observations. Historical
+cumulative-only inputs cannot establish that empirical sample. See the
+[dated spread how-to](../user-guide/migration.md#plot-dated-spreads-and-propagated-errors).
+
+::: ml4t.diagnostic.visualization.signal.plot_spread_timeseries
+    options:
+      show_root_heading: true
+
+::: ml4t.diagnostic.results.signal_results.QuantileAnalysisResult
+    options:
+      show_root_heading: true
+      members:
+        - get_monotonicity
+        - get_dataframe
+        - list_available_dataframes
 
 ## Metrics
 
@@ -144,6 +243,18 @@ These workflows live under `ml4t.diagnostic.evaluation`:
 | Trade diagnostics | `TradeAnalysis`, `TradeShapAnalyzer`, `TradeShapResult` |
 | Event and barrier workflows | `EventStudyAnalysis`, `BarrierAnalysis` |
 
+For complete signed holdings on exact observed keys, see
+[prepared holdings](../user-guide/migration.md#analyze-prepared-holdings-on-observed-keys).
+Optional `sector_mapping` adds [sector aggregates](../user-guide/migration.md#classify-holdings-by-sector)
+without dropping unknown classifications or merging account cash with sector names.
+The result also provides [top holdings and signed weight summaries](../user-guide/migration.md#rank-holdings-across-observations)
+over the supplied observations.
+Calendar/session ingestion and full Pyfolio reporting remain separate work.
+
+::: ml4t.diagnostic.evaluation.portfolio_analysis.PortfolioAnalysis.compute_holdings_analysis
+
+::: ml4t.diagnostic.evaluation.portfolio_analysis.HoldingsAnalysisResult
+
 ## Statistical Tests
 
 ::: ml4t.diagnostic.evaluation.stats
@@ -174,6 +285,23 @@ The integration surface focuses on contracts and the `ml4t-backtest` bridge:
 | Backtest bridge | `compute_metrics_from_result`, `analyze_backtest_result`, `portfolio_analysis_from_result` |
 | Tearsheet generation | `generate_tearsheet_from_result`, `profile_from_run_artifacts`, `generate_tearsheet_from_run_artifacts` |
 
+`analyze_backtest_result(result).occupancy` provides `timeline`, `metrics` and
+`coverage`. Exposure fractions require finite positive equity and finite
+exposures. Undefined ratios remain null; normalized aggregates use defined
+snapshots only. Raw exposure amounts and position counts remain available.
+Coverage names the total and normalized sample sizes; an empty observed window
+has no estimates. See the [executed exposure workflow](../user-guide/migration.md#retain-raw-exposure-when-equity-cannot-normalize-it)
+for the zero/negative-equity behavior and full performance-report restriction.
+
+The profile's `activity` provides `metrics`, `turnover_timeline`,
+`rebalance_summary` and `coverage`. Turnover/cost-drag ratios require finite
+positive equity; raw execution totals remain available otherwise. The turnover
+mean uses defined active observations only. Coverage discloses both all-observation
+and active-observation sample sizes. The result-to-report bridge retains this
+definition instead of replacing it with a producer summary's turnover convention.
+The [executed transaction workflow](../user-guide/migration.md#retain-executed-turnover-when-equity-cannot-normalize-it)
+describes the current timestamp/NAV denominator and remaining session/cost gaps.
+
 ## Visualization
 
 The visualization namespace is Plotly-first and grouped by workflow:
@@ -185,6 +313,13 @@ The visualization namespace is Plotly-first and grouped by workflow:
 | Portfolio analysis | `create_portfolio_dashboard`, `plot_portfolio_cumulative_returns`, `plot_monthly_returns_heatmap`, `plot_drawdown_underwater`, `plot_rolling_sharpe` |
 | Factor analysis | `plot_factor_betas_bar`, `plot_rolling_betas`, `plot_return_attribution_waterfall` |
 | Reporting | `combine_figures_to_html`, `generate_combined_report`, `export_figures_to_pdf` |
+
+The existing portfolio dashboard accepts explicit prepared holdings. See
+[holdings report input, units and availability](../user-guide/migration.md#render-prepared-holdings-in-the-portfolio-dashboard).
+
+::: ml4t.diagnostic.visualization.portfolio.create_portfolio_dashboard
+
+::: ml4t.diagnostic.visualization.portfolio.dashboard.PortfolioTearSheet
 
 For task-by-task input conversion from Alphalens and Pyfolio, see the
 [migration guide](../user-guide/migration.md). For a package-layout overview,

@@ -6,17 +6,30 @@ No Pydantic, no inheritance - just a frozen dataclass.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 from dataclasses import asdict, dataclass, field
+from io import BytesIO
 from typing import TYPE_CHECKING, Any
 
 from ml4t.diagnostic.utils.formatting import format_finite
 
 if TYPE_CHECKING:
+    import polars as pl
+
     from ml4t.diagnostic.results.signal_results.ic import SignalICResult
     from ml4t.diagnostic.results.signal_results.quantile import QuantileAnalysisResult
     from ml4t.diagnostic.results.signal_results.tearsheet import SignalTearSheet
+    from ml4t.diagnostic.results.signal_results.turnover import TurnoverAnalysisResult
+
+
+_OWNED_FRAMES = (
+    ("_prepared_data", "prepared_data"),
+    ("_dated_turnover", "dated_turnover"),
+    ("_dated_autocorrelation", "dated_autocorrelation"),
+    ("_quantile_observations", "quantile_observations"),
+)
 
 
 @dataclass(frozen=True)
@@ -52,7 +65,7 @@ class SignalResult:
     monotonicity : dict[str, float]
         Rank correlation of quantile returns (how monotonic).
     turnover : dict[str, float] | None
-        Mean turnover rate by period.
+        Mean turnover rate at each period's lag in observed factor dates.
     autocorrelation : list[float] | None
         Factor autocorrelation at lags 1, 2, ...
     half_life : float | None
@@ -106,6 +119,62 @@ class SignalResult:
     date_range: tuple[str, str] = ("", "")
     periods: tuple[int, ...] = ()
     quantiles: int = 5
+    preparation_metadata: dict[str, Any] = field(default_factory=dict)
+    _prepared_data: bytes | None = field(default=None, repr=False, compare=False)
+    _dated_turnover: bytes | None = field(default=None, repr=False, compare=False)
+    _dated_autocorrelation: bytes | None = field(default=None, repr=False, compare=False)
+    _quantile_observations: bytes | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def prepared_data(self) -> pl.DataFrame | None:
+        """Return an independent prepared snapshot, when this result owns one."""
+        if self._prepared_data is None:
+            return None
+        import polars as pl
+
+        return pl.read_ipc(BytesIO(self._prepared_data))
+
+    @property
+    def dated_turnover(self) -> pl.DataFrame | None:
+        """Return owned entrants/current observations, not native scalar means."""
+        if self._dated_turnover is None:
+            return None
+        import polars as pl
+
+        return pl.read_ipc(BytesIO(self._dated_turnover))
+
+    @property
+    def dated_autocorrelation(self) -> pl.DataFrame | None:
+        """Return owned full-date-rank Pearson observations and actual counts."""
+        if self._dated_autocorrelation is None:
+            return None
+        import polars as pl
+
+        return pl.read_ipc(BytesIO(self._dated_autocorrelation))
+
+    @property
+    def quantile_observations(self) -> pl.DataFrame | None:
+        """Return actual dated bucket means/counts, not asset samples or simulations."""
+        if self._quantile_observations is None:
+            return None
+        import polars as pl
+
+        return pl.read_ipc(BytesIO(self._quantile_observations))
+
+    def to_turnover_result(self) -> TurnoverAnalysisResult | None:
+        """Convert actual dated observations without synthesizing data from means.
+
+        Native scalar summaries retain their separate definitions. Older results
+        without dated observations and analyses with persistence disabled return
+        None; neither missing dates/buckets nor reference ranks can be recovered
+        from their scalar summaries.
+        """
+        turnover, rank = self.dated_turnover, self.dated_autocorrelation
+        if turnover is None or rank is None:
+            return None
+        from ml4t.diagnostic.results.signal_results.turnover import TurnoverAnalysisResult
+
+        return TurnoverAnalysisResult.from_observations(turnover, rank)
 
     def summary(self) -> str:
         """Human-readable summary of results."""
@@ -178,6 +247,10 @@ class SignalResult:
         -------
         SignalICResult
             Pydantic model compatible with plot_ic_ts, plot_ic_histogram, etc.
+            Its statistics describe the retained common-date observations, not
+            the original per-horizon samples. Select one period to retain that
+            horizon's complete finite IC sample. Empty intersections have
+            unavailable summaries; singletons retain only defined point values.
 
         Raises
         ------
@@ -191,6 +264,7 @@ class SignalResult:
         >>> plot_ic_ts(result.to_ic_result(period=21))
         """
         from ml4t.diagnostic.results.signal_results.ic import SignalICResult
+        from ml4t.diagnostic.signal.signal_ic import compute_ic_summary
 
         if not self.ic_dates:
             raise ValueError("ic_dates not available. Re-run analyze_signal() to capture dates.")
@@ -225,15 +299,21 @@ class SignalResult:
             date_to_ic = dict(zip(self.ic_dates[key], self.ic_series[key], strict=False))
             ic_by_date[key] = [date_to_ic[d] for d in common_dates if d in date_to_ic]
 
+        summaries = {key: compute_ic_summary(values) for key, values in ic_by_date.items()}
         return SignalICResult(
             ic_by_date=ic_by_date,
             dates=common_dates,
-            ic_mean={k: self.ic[k] for k in period_keys},
-            ic_std={k: self.ic_std[k] for k in period_keys},
-            ic_t_stat={k: self.ic_t_stat[k] for k in period_keys},
-            ic_p_value={k: self.ic_p_value[k] for k in period_keys},
-            ic_positive_pct={k: self.ic_positive_pct.get(k, 0.0) for k in period_keys},
-            ic_ir={k: self.ic_ir.get(k, 0.0) for k in period_keys},
+            ic_mean={key: summary["mean"] for key, summary in summaries.items()},
+            ic_std={key: summary["std"] for key, summary in summaries.items()},
+            ic_t_stat={key: summary["t_stat"] for key, summary in summaries.items()},
+            ic_p_value={key: summary["p_value"] for key, summary in summaries.items()},
+            ic_positive_pct={
+                key: summary["pct_positive"] * 100 for key, summary in summaries.items()
+            },
+            ic_ir={
+                key: summary["mean"] / summary["std"] if summary["std"] > 0 else float("nan")
+                for key, summary in summaries.items()
+            },
         )
 
     def to_quantile_result(self) -> QuantileAnalysisResult:
@@ -326,12 +406,16 @@ class SignalResult:
             is_monotonic=is_monotonic,
             monotonicity_direction=monotonicity_direction,
             rank_correlation=rank_correlation,
+            observations_ipc_base64=base64.b64encode(self._quantile_observations).decode("ascii")
+            if self._quantile_observations is not None
+            else None,
         )
 
     def to_tear_sheet(self, signal_name: str = "signal") -> SignalTearSheet:
-        """Convert to full SignalTearSheet for dashboard display.
+        """Convert available analysis components for dashboard display.
 
-        Bundles to_ic_result() and to_quantile_result() into a SignalTearSheet.
+        Bundle IC, quantile summaries and actual dated persistence when retained.
+        This does not establish cumulative paths or complete legacy tear sheets.
 
         Parameters
         ----------
@@ -341,7 +425,7 @@ class SignalResult:
         Returns
         -------
         SignalTearSheet
-            Pydantic model with IC and quantile analysis components.
+            Pydantic model with available IC, quantile and persistence components.
 
         Examples
         --------
@@ -361,6 +445,7 @@ class SignalResult:
             date_range=self.date_range,
             ic_analysis=ic_result,
             quantile_analysis=quantile_result,
+            turnover_analysis=self.to_turnover_result(),
         )
 
     # =========================================================================
@@ -369,7 +454,17 @@ class SignalResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Export to dictionary."""
-        return asdict(self)
+        data = asdict(self)
+        for private, public in _OWNED_FRAMES:
+            payload = data.pop(private)
+            if payload is not None:
+                data[public] = {
+                    "format": "arrow-ipc-base64",
+                    "data": base64.b64encode(payload).decode("ascii"),
+                }
+        if not data["preparation_metadata"]:
+            data.pop("preparation_metadata")
+        return data
 
     def to_json(self, path: str | None = None, indent: int = 2) -> str:
         """Export to JSON string or file.
@@ -428,11 +523,59 @@ class SignalResult:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
 
+        for private, public in _OWNED_FRAMES:
+            if private in data:
+                raise ValueError(f"private {public} data is not a supported JSON field")
+            encoded = data.pop(public, None)
+            if encoded is not None:
+                if not isinstance(encoded, dict) or encoded.get("format") != "arrow-ipc-base64":
+                    raise ValueError(f"unsupported {public} format")
+                import polars as pl
+
+                try:
+                    payload = base64.b64decode(encoded["data"], validate=True)
+                    pl.read_ipc(BytesIO(payload))
+                except (KeyError, ValueError, TypeError, OSError, pl.exceptions.PolarsError) as exc:
+                    raise ValueError(f"invalid {public} payload") from exc
+                data[private] = payload
+        if (data.get("_dated_turnover") is None) != (data.get("_dated_autocorrelation") is None):
+            raise ValueError(
+                "dated persistence requires both turnover and autocorrelation observations"
+            )
+
         # Convert lists back to tuples for immutable fields
         if "date_range" in data:
             data["date_range"] = tuple(data["date_range"])
         if "periods" in data:
             data["periods"] = tuple(data["periods"])
+
+        def restore_numeric(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: restore_numeric(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [restore_numeric(item) for item in value]
+            return float("nan") if value is None else value
+
+        for name in (
+            "ic",
+            "ic_std",
+            "ic_t_stat",
+            "ic_p_value",
+            "ic_ir",
+            "ic_positive_pct",
+            "ic_series",
+            "quantile_returns",
+            "quantile_returns_std",
+            "spread",
+            "spread_t_stat",
+            "spread_p_value",
+            "spread_std",
+            "monotonicity",
+            "turnover",
+            "autocorrelation",
+        ):
+            if name in data and data[name] is not None:
+                data[name] = restore_numeric(data[name])
 
         # Convert quantile keys back to int
         if "quantile_returns" in data:

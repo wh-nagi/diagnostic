@@ -93,6 +93,9 @@ class TearsheetTemplate:
                 ),
                 TearsheetSection("activity_strip", "Activity", band="implementation", priority=3),
                 TearsheetSection(
+                    "activity_overview", "Turnover & Costs", band="implementation", priority=4
+                ),
+                TearsheetSection(
                     "occupancy_overview",
                     "Exposure",
                     band="implementation",
@@ -206,6 +209,9 @@ class TearsheetTemplate:
                     "annual_returns", "Annual Returns", band="implementation", priority=8
                 ),
                 TearsheetSection("activity_strip", "Activity", band="burden", priority=10),
+                TearsheetSection(
+                    "activity_overview", "Turnover & Costs", band="burden", priority=11
+                ),
                 TearsheetSection("occupancy_overview", "Exposure", band="burden", priority=11),
                 TearsheetSection("attribution_overview", "Attribution", band="burden", priority=12),
                 TearsheetSection("cost_waterfall", "Cost Attribution", band="burden", priority=13),
@@ -411,6 +417,9 @@ class TearsheetTemplate:
                 ),
                 # === Trading ===
                 TearsheetSection("activity_strip", "Activity", band="trading", priority=20),
+                TearsheetSection(
+                    "activity_overview", "Turnover & Costs", band="trading", priority=21
+                ),
                 TearsheetSection("occupancy_overview", "Exposure", band="trading", priority=21),
                 TearsheetSection(
                     "rebalance_timeline", "Rebalance Events", band="trading", priority=22
@@ -846,6 +855,21 @@ TEARSHEET_CSS = """
     .chart-container .plotly-graph-div,
     .chart-container .js-plotly-plot {
         width: 100% !important;
+    }
+
+    .report-section[data-section="attribution_overview"] .chart-container,
+    .report-section[data-section="cost_sensitivity"] .chart-container {
+        overflow-x: auto;
+    }
+
+    .report-section[data-section="attribution_overview"] .chart-container > div,
+    .report-section[data-section="cost_sensitivity"] .chart-container > div {
+        min-width: 650px;
+    }
+
+    .report-section[data-section="attribution_overview"] .section-footnote,
+    .report-section[data-section="cost_sensitivity"] .section-footnote {
+        font-size: 13px;
     }
 
     /* -- KPI Strip --------------------------------------- */
@@ -1382,7 +1406,7 @@ TEARSHEET_CSS = """
     }
 
     .section-detail-summary::before {
-        content: '\25b8';
+        content: '▸';
         display: inline-block;
         margin-right: 8px;
         font-size: 11px;

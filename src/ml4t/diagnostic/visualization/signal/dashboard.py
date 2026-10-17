@@ -240,7 +240,7 @@ class SignalDashboard(BaseDashboard):
 
         # Compose tabbed layout
         html_content = f"""
-        <div class="tab-navigation">
+        <div class="tab-navigation" style="flex-wrap: wrap;">
             {tab_buttons}
         </div>
         {tab_divs}
@@ -389,7 +389,8 @@ class SignalDashboard(BaseDashboard):
 
             spread = qa.spread_mean.get(first_period, 0)
             spread_t = qa.spread_t_stat.get(first_period, 0)
-            monotonic = qa.is_monotonic.get(first_period, False)
+            monotonic = qa.get_monotonicity(first_period)[0] if periods else None
+            monotonic_display = "N/A" if monotonic is None else "Yes" if monotonic else "No"
             spread_display = format_finite(spread, ".4%")
             spread_t_display = format_finite(spread_t, ".2f")
 
@@ -406,7 +407,7 @@ class SignalDashboard(BaseDashboard):
                 </div>
                 <div class="metric-card">
                     <div class="metric-label">Monotonic</div>
-                    <div class="metric-value">{"Yes" if monotonic else "No"}</div>
+                    <div class="metric-value">{monotonic_display}</div>
                 </div>
             </div>
             """)
@@ -415,14 +416,20 @@ class SignalDashboard(BaseDashboard):
         if tear_sheet.turnover_analysis is not None:
             ta = tear_sheet.turnover_analysis
             periods = list(ta.mean_turnover.keys())
-            first_period = periods[0] if periods else "1D"
+            first_period = periods[0] if periods else "unavailable"
 
-            turnover = ta.mean_turnover.get(first_period, 0)
+            turnover = ta.mean_turnover.get(first_period)
             half_life = ta.half_life.get(first_period)
+            if ta.dated_turnover_ipc_base64 is not None:
+                summary = ta.get_dataframe("summary")
+                first = summary.row(0, named=True) if not summary.is_empty() else {}
+                first_period = first.get("period", "observations")
+                turnover = first.get("mean_turnover")
+                half_life = None
             turnover_display = format_finite(turnover, ".1%")
             turnover_label = (
                 "N/A"
-                if not math.isfinite(turnover)
+                if turnover is None or not math.isfinite(turnover)
                 else "High"
                 if turnover > 0.3
                 else "Moderate"
@@ -494,6 +501,13 @@ class SignalDashboard(BaseDashboard):
 
         ic = tear_sheet.ic_analysis
         theme_name = "dark" if self.theme == "dark" else "default"
+        html_parts.append(
+            f"<p>The current IC component contains {len(ic.dates)} aligned dates. "
+            "The SignalResult bridge retains common finite IC dates across requested "
+            "horizons and summarizes those observations. Select a single-period "
+            "component for that horizon's full finite sample. No calendar grid "
+            "or unavailable-date history is inferred.</p>"
+        )
 
         # Period selector
         periods = list(ic.ic_mean.keys())
@@ -503,7 +517,7 @@ class SignalDashboard(BaseDashboard):
         try:
             fig_ts = plot_ic_ts(ic, period=periods[0], theme=theme_name)
             html_parts.append('<div class="plot-container">')
-            html_parts.append(fig_ts.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(self._figure_html(fig_ts))
             html_parts.append("</div>")
         except Exception:
             logger.debug("IC time series plot failed", exc_info=True)
@@ -515,8 +529,10 @@ class SignalDashboard(BaseDashboard):
         # IC Histogram
         try:
             fig_hist = plot_ic_histogram(ic, period=periods[0], theme=theme_name)
-            html_parts.append('<div class="plot-container" style="flex: 1; min-width: 400px;">')
-            html_parts.append(fig_hist.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(
+                '<div class="plot-container" style="flex: 1 1 400px; min-width: 0; max-width: 100%;">'
+            )
+            html_parts.append(self._figure_html(fig_hist))
             html_parts.append("</div>")
         except Exception:
             logger.debug("IC histogram plot failed", exc_info=True)
@@ -525,8 +541,10 @@ class SignalDashboard(BaseDashboard):
         # IC Q-Q Plot
         try:
             fig_qq = plot_ic_qq(ic, period=periods[0], theme=theme_name)
-            html_parts.append('<div class="plot-container" style="flex: 1; min-width: 400px;">')
-            html_parts.append(fig_qq.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(
+                '<div class="plot-container" style="flex: 1 1 400px; min-width: 0; max-width: 100%;">'
+            )
+            html_parts.append(self._figure_html(fig_qq))
             html_parts.append("</div>")
         except Exception:
             logger.debug("IC Q-Q plot failed", exc_info=True)
@@ -538,7 +556,7 @@ class SignalDashboard(BaseDashboard):
         try:
             fig_heatmap = plot_monthly_ic_heatmap(ic, period=periods[0], theme=theme_name)
             html_parts.append('<div class="plot-container">')
-            html_parts.append(fig_heatmap.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(self._figure_html(fig_heatmap))
             html_parts.append("</div>")
         except Exception:
             logger.debug("IC heatmap plot failed", exc_info=True)
@@ -550,6 +568,29 @@ class SignalDashboard(BaseDashboard):
     # Quantile Analysis Tab
     # =========================================================================
 
+    def _figure_html(self, figure: Any) -> str:
+        """Fit embedded charts to the report's available width and actual prose scale."""
+        figure.update_layout(
+            width=None,
+            autosize=True,
+            font={"family": self._font_family, "size": 14},
+            title={"font": {"family": self._font_family, "size": 16}},
+            legend={"font": {"family": self._font_family, "size": 14}},
+        )
+        figure.update_xaxes(
+            tickfont={"family": self._font_family, "size": 14},
+            title_font={"family": self._font_family, "size": 14},
+            automargin=True,
+        )
+        figure.update_yaxes(
+            tickfont={"family": self._font_family, "size": 14},
+            title_font={"family": self._font_family, "size": 14},
+            automargin=True,
+        )
+        for annotation in figure.layout.annotations:
+            annotation.font.update(family=self._font_family, size=13)
+        return figure.to_html(include_plotlyjs=False, full_html=False, config={"responsive": True})
+
     def _create_quantile_tab(self, tear_sheet: SignalTearSheet) -> str:
         """Create Quantile Analysis tab."""
         html_parts = ["<h2>Quantile Returns Analysis</h2>"]
@@ -559,6 +600,12 @@ class SignalDashboard(BaseDashboard):
             return "\n".join(html_parts)
 
         qa = tear_sheet.quantile_analysis
+        html_parts.append(
+            "<p>Bars retain pooled asset-date means. Empirical violins use one actual "
+            "observed-date bucket mean per defined date, not simulated returns. "
+            "Their means can differ when membership sizes vary. Missing empirical "
+            "observations are unavailable rather than reconstructed from summaries.</p>"
+        )
         theme_name = "dark" if self.theme == "dark" else "default"
 
         # Period selector
@@ -569,7 +616,7 @@ class SignalDashboard(BaseDashboard):
         try:
             fig_bar = plot_quantile_returns_bar(qa, period=periods[0], theme=theme_name)
             html_parts.append('<div class="plot-container">')
-            html_parts.append(fig_bar.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(self._figure_html(fig_bar))
             html_parts.append("</div>")
         except Exception:
             logger.debug("Quantile returns bar chart failed", exc_info=True)
@@ -581,8 +628,10 @@ class SignalDashboard(BaseDashboard):
         # Quantile Returns Violin
         try:
             fig_violin = plot_quantile_returns_violin(qa, period=periods[0], theme=theme_name)
-            html_parts.append('<div class="plot-container" style="flex: 1; min-width: 400px;">')
-            html_parts.append(fig_violin.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(
+                '<div class="plot-container" style="flex: 1 1 400px; min-width: 0; max-width: 100%;">'
+            )
+            html_parts.append(self._figure_html(fig_violin))
             html_parts.append("</div>")
         except Exception:
             logger.debug("Quantile violin plot failed", exc_info=True)
@@ -591,8 +640,10 @@ class SignalDashboard(BaseDashboard):
         # Spread Time Series
         try:
             fig_spread = plot_spread_timeseries(qa, period=periods[0], theme=theme_name)
-            html_parts.append('<div class="plot-container" style="flex: 1; min-width: 400px;">')
-            html_parts.append(fig_spread.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(
+                '<div class="plot-container" style="flex: 1 1 400px; min-width: 0; max-width: 100%;">'
+            )
+            html_parts.append(self._figure_html(fig_spread))
             html_parts.append("</div>")
         except Exception:
             logger.debug("Spread time series plot failed", exc_info=True)
@@ -605,7 +656,7 @@ class SignalDashboard(BaseDashboard):
             try:
                 fig_cum = plot_cumulative_returns(qa, period=periods[0], theme=theme_name)
                 html_parts.append('<div class="plot-container">')
-                html_parts.append(fig_cum.to_html(include_plotlyjs=False, full_html=False))
+                html_parts.append(self._figure_html(fig_cum))
                 html_parts.append("</div>")
             except Exception:
                 logger.debug("Cumulative returns plot failed", exc_info=True)
@@ -626,6 +677,43 @@ class SignalDashboard(BaseDashboard):
             return "\n".join(html_parts)
 
         ta = tear_sheet.turnover_analysis
+        if ta.dated_turnover_ipc_base64 is not None:
+            html_parts.append(
+                "<p>Turnover uses entrants_over_current membership fractions. Rank autocorrelation "
+                "uses full-date average ranks and paired Pearson correlation. Lags count "
+                "observations on the recorded clock, not inferred days or sessions. "
+                "Unavailable estimates remain missing; no half-life or confidence interval "
+                "is inferred. Native scalar summaries retain their separate definitions.</p>"
+            )
+            html_parts.append(
+                f'<div style="overflow-x: auto;">{self._create_turnover_summary_table(ta)}</div>'
+            )
+            theme_name = "dark" if self.theme == "dark" else "default"
+            html_parts.append(
+                "<p>The dated charts show the first recorded observation lag. "
+                "Select another recorded lag explicitly in the plotting API; "
+                "the tables below retain all recorded lags.</p>"
+            )
+            for function in [plot_top_bottom_turnover, plot_autocorrelation]:
+                html_parts.append('<div class="plot-container">')
+                html_parts.append(self._figure_html(function(ta, theme=theme_name)))
+                html_parts.append("</div>")
+            for name, title in [
+                ("dated_turnover", "Dated quantile turnover"),
+                ("dated_autocorrelation", "Dated rank autocorrelation"),
+            ]:
+                html_parts.append(f"<h3>{title}</h3>")
+                observations = ta.get_dataframe(name)
+                observations = observations.select(
+                    ["date", *[column for column in observations.columns if column != "date"]]
+                )
+                table = observations.to_pandas().to_html(
+                    index=False, na_rep="N/A", classes="feature-table", border=0
+                )
+                html_parts.append(
+                    f'<div style="overflow-x: auto; white-space: nowrap;">{table}</div>'
+                )
+            return "\n".join(html_parts)
         theme_name = "dark" if self.theme == "dark" else "default"
 
         # Two-column layout
@@ -634,8 +722,10 @@ class SignalDashboard(BaseDashboard):
         # Top/Bottom Turnover
         try:
             fig_turnover = plot_top_bottom_turnover(ta, theme=theme_name)
-            html_parts.append('<div class="plot-container" style="flex: 1; min-width: 400px;">')
-            html_parts.append(fig_turnover.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(
+                '<div class="plot-container" style="flex: 1 1 400px; min-width: 0; max-width: 100%;">'
+            )
+            html_parts.append(self._figure_html(fig_turnover))
             html_parts.append("</div>")
         except Exception:
             logger.debug("Turnover chart failed", exc_info=True)
@@ -646,8 +736,10 @@ class SignalDashboard(BaseDashboard):
         if periods:
             try:
                 fig_ac = plot_autocorrelation(ta, period=periods[0], theme=theme_name)
-                html_parts.append('<div class="plot-container" style="flex: 1; min-width: 400px;">')
-                html_parts.append(fig_ac.to_html(include_plotlyjs=False, full_html=False))
+                html_parts.append(
+                    '<div class="plot-container" style="flex: 1 1 400px; min-width: 0; max-width: 100%;">'
+                )
+                html_parts.append(self._figure_html(fig_ac))
                 html_parts.append("</div>")
             except Exception:
                 logger.debug("Autocorrelation plot failed", exc_info=True)
@@ -662,15 +754,14 @@ class SignalDashboard(BaseDashboard):
 
     def _create_turnover_summary_table(self, ta: Any) -> str:
         """Create turnover summary table."""
-        periods = list(ta.mean_turnover.keys())
-
         rows = []
-        for period in periods:
-            mean_to = ta.mean_turnover.get(period, 0)
-            top_to = ta.top_quantile_turnover.get(period, 0)
-            bottom_to = ta.bottom_quantile_turnover.get(period, 0)
-            mean_ac = ta.mean_autocorrelation.get(period, 0)
-            half_life = ta.half_life.get(period)
+        for values in ta.get_dataframe("summary").to_dicts():
+            period = values["period"]
+            mean_to = values["mean_turnover"]
+            top_to = values["top_turnover"]
+            bottom_to = values["bottom_turnover"]
+            mean_ac = values["mean_autocorrelation"]
+            half_life = values["half_life"]
             mean_to_display = format_finite(mean_to, ".1%")
             top_to_display = format_finite(top_to, ".1%")
             bottom_to_display = format_finite(bottom_to, ".1%")
@@ -801,7 +892,7 @@ class SignalDashboard(BaseDashboard):
                 theme=theme_name,
             )
             html_parts.append('<div class="plot-container">')
-            html_parts.append(fig_caar.to_html(include_plotlyjs=False, full_html=False))
+            html_parts.append(self._figure_html(fig_caar))
             html_parts.append("</div>")
         except Exception as e:
             html_parts.append(f"<p>CAAR plot unavailable: {e}</p>")
@@ -819,7 +910,7 @@ class SignalDashboard(BaseDashboard):
                 ar_results = event_analysis.individual_results[:30]
                 fig_heatmap = plot_event_heatmap(ar_results, theme=theme_name)
                 html_parts.append('<div class="plot-container" style="flex: 1; min-width: 500px;">')
-                html_parts.append(fig_heatmap.to_html(include_plotlyjs=False, full_html=False))
+                html_parts.append(self._figure_html(fig_heatmap))
                 html_parts.append("</div>")
             except Exception as e:
                 html_parts.append(f"<p>Event heatmap unavailable: {e}</p>")
@@ -832,8 +923,10 @@ class SignalDashboard(BaseDashboard):
                     show_kde=True,
                     theme=theme_name,
                 )
-                html_parts.append('<div class="plot-container" style="flex: 1; min-width: 400px;">')
-                html_parts.append(fig_dist.to_html(include_plotlyjs=False, full_html=False))
+                html_parts.append(
+                    '<div class="plot-container" style="flex: 1 1 400px; min-width: 0; max-width: 100%;">'
+                )
+                html_parts.append(self._figure_html(fig_dist))
                 html_parts.append("</div>")
             except Exception as e:
                 html_parts.append(f"<p>AR distribution plot unavailable: {e}</p>")
@@ -853,7 +946,7 @@ class SignalDashboard(BaseDashboard):
                     theme=theme_name,
                 )
                 html_parts.append('<div class="plot-container">')
-                html_parts.append(fig_car.to_html(include_plotlyjs=False, full_html=False))
+                html_parts.append(self._figure_html(fig_car))
                 html_parts.append("</div>")
             except Exception as e:
                 html_parts.append(f"<p>CAR by event chart unavailable: {e}</p>")
@@ -959,6 +1052,8 @@ class SignalDashboard(BaseDashboard):
 
     def _compose_html(self) -> str:
         """Compose complete HTML document."""
+        from plotly.offline import get_plotlyjs
+
         return f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -966,7 +1061,7 @@ class SignalDashboard(BaseDashboard):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{self.title}</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script>{get_plotlyjs()}</script>
     {self._get_base_styles()}
 </head>
 <body>

@@ -19,13 +19,34 @@ from ml4t.diagnostic.metrics.risk_adjusted import sharpe_ratio, sortino_ratio
 
 
 def _filled_notional_expr() -> pl.Expr:
-    return pl.col("quantity").abs() * pl.col("price")
+    return pl.col("quantity").abs() * pl.col("price") * pl.col("multiplier")
 
 
 def _implementation_cost_expr() -> pl.Expr:
     return pl.col("commission").fill_null(0.0) + (
-        pl.col("quantity").abs() * pl.col("slippage").fill_null(0.0)
+        pl.col("quantity").abs() * pl.col("slippage").fill_null(0.0) * pl.col("multiplier")
     )
+
+
+def _fill_cash_units(fills: pl.DataFrame, trades: pl.DataFrame | None) -> pl.DataFrame:
+    """Use declared fill units or unambiguous producer trade point values."""
+    if fills.is_empty():
+        return fills.clone()
+    if "multiplier" not in fills.columns:
+        if trades is not None and "multiplier" in trades.columns:
+            units = trades.select(pl.col("symbol").alias("asset"), "multiplier").unique()
+            units = units.join(fills.select("asset").unique(), on="asset", how="inner")
+            if units["asset"].is_duplicated().any():
+                raise ValueError("trade multipliers must be unambiguous for each fill asset")
+            fills = fills.join(units, on="asset", how="left")
+        else:
+            fills = fills.with_columns(pl.lit(1.0).alias("multiplier"))
+    values = fills["multiplier"]
+    if not values.dtype.is_numeric():
+        raise TypeError("fill multipliers must be real numeric values")
+    if values.null_count() or not values.is_finite().all() or (values <= 0).any():
+        raise ValueError("fill multipliers must be finite, positive and declared for every asset")
+    return fills.with_columns(pl.col("multiplier").cast(pl.Float64))
 
 
 def _rebalance_key_expr() -> pl.Expr:
@@ -46,6 +67,7 @@ def _empty_turnover_timeline() -> pl.DataFrame:
             "implementation_cost": pl.Float64(),
             "turnover": pl.Float64(),
             "cost_drag": pl.Float64(),
+            "normalization_status": pl.String(),
         }
     )
 
@@ -215,7 +237,7 @@ def compute_edge_metrics(trades_df: pl.DataFrame) -> dict[str, Any]:
             "metrics": {
                 "num_trades": 0,
                 "win_rate": 0.0,
-                "profit_factor": 0.0,
+                "profit_factor": float("nan"),
                 "expectancy": 0.0,
                 "avg_trade": 0.0,
                 "avg_winner": 0.0,
@@ -244,11 +266,17 @@ def compute_edge_metrics(trades_df: pl.DataFrame) -> dict[str, Any]:
     total_wins = float(wins["pnl"].sum()) if not wins.is_empty() else 0.0
     total_losses = abs(float(losses["pnl"].sum())) if not losses.is_empty() else 0.0
     avg_trade = float(closed["pnl"].mean()) if closed.height else 0.0
+    if total_losses > 0:
+        profit_factor = total_wins / total_losses
+    elif total_wins > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = float("nan")
 
     metrics = {
         "num_trades": closed.height,
         "win_rate": float(wins.height / closed.height) if closed.height else 0.0,
-        "profit_factor": float(total_wins / total_losses) if total_losses > 0 else float("inf"),
+        "profit_factor": profit_factor,
         "expectancy": avg_trade,
         "avg_trade": avg_trade,
         "avg_winner": float(wins["pnl"].mean()) if not wins.is_empty() else 0.0,
@@ -279,9 +307,17 @@ def compute_edge_metrics(trades_df: pl.DataFrame) -> dict[str, Any]:
 
 
 def compute_activity_metrics(
-    fills_df: pl.DataFrame, portfolio_state_df: pl.DataFrame
+    fills_df: pl.DataFrame,
+    portfolio_state_df: pl.DataFrame,
+    *,
+    trades_df: pl.DataFrame | None = None,
 ) -> dict[str, Any]:
-    """Compute fill and rebalance activity metrics from raw surfaces."""
+    """Compute activity in cash units using declared fill or trade multipliers.
+
+    Legacy tables without either declaration retain cash-per-unit prices.
+    Such tables do not establish support for contract point-value prices.
+    Commission is already cash; per-unit price slippage uses the multiplier.
+    """
     if fills_df.is_empty():
         return {
             "metrics": {
@@ -295,14 +331,27 @@ def compute_activity_metrics(
             },
             "turnover_timeline": _empty_turnover_timeline(),
             "rebalance_summary": _empty_rebalance_summary(),
+            "coverage": {
+                "n_observations": 0,
+                "n_normalized_observations": 0,
+                "normalization_coverage": None,
+                "status": "unavailable",
+                "n_active_observations": 0,
+                "n_normalized_active_observations": 0,
+                "active_normalization_coverage": None,
+            },
         }
 
-    fills = fills_df.sort("timestamp").with_columns(
-        [
-            _filled_notional_expr().alias("filled_notional"),
-            _implementation_cost_expr().alias("implementation_cost"),
-            _rebalance_key_expr(),
-        ]
+    fills = (
+        _fill_cash_units(fills_df, trades_df)
+        .sort("timestamp")
+        .with_columns(
+            [
+                _filled_notional_expr().alias("filled_notional"),
+                _implementation_cost_expr().alias("implementation_cost"),
+                _rebalance_key_expr(),
+            ]
+        )
     )
 
     rebalance_summary = (
@@ -321,6 +370,15 @@ def compute_activity_metrics(
     turnover_timeline = _empty_turnover_timeline()
     avg_turnover: float | None = None
     max_turnover: float | None = None
+    coverage: dict[str, Any] = {
+        "n_observations": 0,
+        "n_normalized_observations": 0,
+        "normalization_coverage": None,
+        "status": "unavailable",
+        "n_active_observations": 0,
+        "n_normalized_active_observations": 0,
+        "active_normalization_coverage": None,
+    }
     if not portfolio_state_df.is_empty():
         fills_by_timestamp = fills.group_by("timestamp").agg(
             [
@@ -340,23 +398,46 @@ def compute_activity_metrics(
             )
             .with_columns(
                 [
-                    pl.when(pl.col("equity") > 0)
+                    pl.when(pl.col("equity").is_finite() & (pl.col("equity") > 0))
                     .then(pl.col("filled_notional") / pl.col("equity"))
-                    .otherwise(0.0)
+                    .otherwise(None)
                     .alias("turnover"),
-                    pl.when(pl.col("equity") > 0)
+                    pl.when(pl.col("equity").is_finite() & (pl.col("equity") > 0))
                     .then(pl.col("implementation_cost") / pl.col("equity"))
-                    .otherwise(0.0)
+                    .otherwise(None)
                     .alias("cost_drag"),
+                    pl.when(pl.col("equity").is_null() | ~pl.col("equity").is_finite())
+                    .then(pl.lit("unusable_equity"))
+                    .when(pl.col("equity") <= 0)
+                    .then(pl.lit("nonpositive_equity"))
+                    .otherwise(pl.lit("defined"))
+                    .alias("normalization_status"),
                 ]
             )
         )
-        # Average turnover on rebalance days only (not diluted by non-trading days)
+        # The mean uses active observations, not untraded timestamps or inferred sessions.
         rebalance_days = turnover_timeline.filter(pl.col("filled_notional") > 0)
-        avg_turnover = (
-            float(rebalance_days["turnover"].mean()) if rebalance_days.height > 0 else None
-        )
-        max_turnover = float(turnover_timeline["turnover"].max())
+        avg_turnover = rebalance_days["turnover"].mean()
+        max_turnover = turnover_timeline["turnover"].max()
+        n_normalized = turnover_timeline.filter(pl.col("normalization_status") == "defined").height
+        n_active_normalized = rebalance_days.filter(
+            pl.col("normalization_status") == "defined"
+        ).height
+        coverage = {
+            "n_observations": turnover_timeline.height,
+            "n_normalized_observations": n_normalized,
+            "normalization_coverage": n_normalized / turnover_timeline.height,
+            "status": "available"
+            if n_normalized == turnover_timeline.height
+            else "partial"
+            if n_normalized
+            else "unavailable",
+            "n_active_observations": rebalance_days.height,
+            "n_normalized_active_observations": n_active_normalized,
+            "active_normalization_coverage": n_active_normalized / rebalance_days.height
+            if rebalance_days.height
+            else None,
+        }
 
     metrics = {
         "num_fills": fills.height,
@@ -371,6 +452,7 @@ def compute_activity_metrics(
         "metrics": metrics,
         "turnover_timeline": turnover_timeline,
         "rebalance_summary": rebalance_summary,
+        "coverage": coverage,
     }
 
 
@@ -379,14 +461,14 @@ def compute_occupancy_metrics(portfolio_state_df: pl.DataFrame) -> dict[str, Any
     if portfolio_state_df.is_empty():
         return {
             "metrics": {
-                "time_in_market": 0.0,
-                "avg_invested_fraction": 0.0,
-                "avg_gross_exposure": 0.0,
-                "max_gross_exposure": 0.0,
-                "avg_net_exposure": 0.0,
-                "max_net_exposure": 0.0,
-                "avg_open_positions": 0.0,
-                "max_open_positions": 0,
+                "time_in_market": None,
+                "avg_invested_fraction": None,
+                "avg_gross_exposure": None,
+                "max_gross_exposure": None,
+                "avg_net_exposure": None,
+                "max_net_exposure": None,
+                "avg_open_positions": None,
+                "max_open_positions": None,
             },
             "timeline": pl.DataFrame(
                 schema={
@@ -395,27 +477,39 @@ def compute_occupancy_metrics(portfolio_state_df: pl.DataFrame) -> dict[str, Any
                     "gross_exposure": pl.Float64(),
                     "net_exposure": pl.Float64(),
                     "open_positions": pl.Int32(),
+                    **portfolio_state_df.schema,
                     "invested_fraction": pl.Float64(),
                     "gross_exposure_fraction": pl.Float64(),
                     "net_exposure_fraction": pl.Float64(),
+                    "normalization_status": pl.String(),
                 }
             ),
+            "coverage": {
+                "n_observations": 0,
+                "n_normalized_observations": 0,
+                "normalization_coverage": None,
+                "status": "unavailable",
+            },
         }
 
+    equity = pl.col("equity")
+    gross_fraction = pl.col("gross_exposure") / equity
+    net_fraction = pl.col("net_exposure") / equity
+    usable_equity = equity.is_not_null() & equity.is_finite()
+    valid = usable_equity & (equity > 0) & gross_fraction.is_finite() & net_fraction.is_finite()
     timeline = portfolio_state_df.sort("timestamp").with_columns(
         [
-            pl.when(pl.col("equity") > 0)
-            .then(pl.col("gross_exposure") / pl.col("equity"))
-            .otherwise(0.0)
-            .alias("invested_fraction"),
-            pl.when(pl.col("equity") > 0)
-            .then(pl.col("gross_exposure") / pl.col("equity"))
-            .otherwise(0.0)
-            .alias("gross_exposure_fraction"),
-            pl.when(pl.col("equity") > 0)
-            .then(pl.col("net_exposure") / pl.col("equity"))
-            .otherwise(0.0)
-            .alias("net_exposure_fraction"),
+            pl.when(valid).then(gross_fraction).otherwise(None).alias("invested_fraction"),
+            pl.when(valid).then(gross_fraction).otherwise(None).alias("gross_exposure_fraction"),
+            pl.when(valid).then(net_fraction).otherwise(None).alias("net_exposure_fraction"),
+            pl.when(~usable_equity)
+            .then(pl.lit("unusable_equity"))
+            .when(equity <= 0)
+            .then(pl.lit("nonpositive_equity"))
+            .when(valid.fill_null(False))
+            .then(pl.lit("defined"))
+            .otherwise(pl.lit("unusable_exposure"))
+            .alias("normalization_status"),
         ]
     )
 
@@ -423,19 +517,31 @@ def compute_occupancy_metrics(portfolio_state_df: pl.DataFrame) -> dict[str, Any
         "time_in_market": float(
             timeline.select((pl.col("open_positions") > 0).mean().alias("value"))["value"][0]
         ),
-        "avg_invested_fraction": float(timeline["invested_fraction"].mean()),
-        "avg_gross_exposure": float(timeline["gross_exposure_fraction"].mean()),
-        "max_gross_exposure": float(timeline["gross_exposure_fraction"].max()),
-        "avg_net_exposure": float(timeline["net_exposure_fraction"].mean()),
-        "max_net_exposure": float(timeline["net_exposure_fraction"].abs().max()),
+        "avg_invested_fraction": timeline["invested_fraction"].mean(),
+        "avg_gross_exposure": timeline["gross_exposure_fraction"].mean(),
+        "max_gross_exposure": timeline["gross_exposure_fraction"].max(),
+        "avg_net_exposure": timeline["net_exposure_fraction"].mean(),
+        "max_net_exposure": timeline["net_exposure_fraction"].abs().max(),
         "avg_open_positions": float(timeline["open_positions"].mean()),
         "max_open_positions": int(timeline["open_positions"].max()),
     }
-    return {"metrics": metrics, "timeline": timeline}
+    n_normalized = timeline.filter(pl.col("normalization_status") == "defined").height
+    coverage = {
+        "n_observations": timeline.height,
+        "n_normalized_observations": n_normalized,
+        "normalization_coverage": n_normalized / timeline.height,
+        "status": "available"
+        if n_normalized == timeline.height
+        else "partial"
+        if n_normalized
+        else "unavailable",
+    }
+    return {"metrics": metrics, "timeline": timeline, "coverage": coverage}
 
 
 def compute_attribution_metrics(trades_df: pl.DataFrame, fills_df: pl.DataFrame) -> dict[str, Any]:
     """Compute symbol contribution and burden metrics from trades and fills."""
+    fills_df = _fill_cash_units(fills_df, trades_df)
     trade_group = (
         trades_df.group_by("symbol").agg(
             [

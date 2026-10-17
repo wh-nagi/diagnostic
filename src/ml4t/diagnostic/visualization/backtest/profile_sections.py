@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import TYPE_CHECKING
 
 import plotly.graph_objects as go
@@ -59,8 +60,9 @@ def plot_activity_overview(
     import html as html_mod
 
     theme = validate_theme(theme)
-    timeline = profile.activity["turnover_timeline"]
-    rebalance = profile.activity["rebalance_summary"].head(15)
+    activity = profile.activity
+    timeline = activity["turnover_timeline"]
+    rebalance = activity["rebalance_summary"].head(15)
 
     fig = go.Figure()
 
@@ -69,9 +71,17 @@ def plot_activity_overview(
             go.Scatter(
                 x=timeline["timestamp"].to_list(),
                 y=timeline["turnover"].to_list(),
-                mode="lines",
+                mode="lines+markers",
                 name="Turnover",
                 line={"width": 1.5},
+                customdata=timeline.select(
+                    "equity", "filled_notional", "implementation_cost", "normalization_status"
+                ).rows(),
+                hovertemplate=(
+                    "%{x}<br>Turnover: %{y}<br>Equity: %{customdata[0]}"
+                    "<br>Filled notional: %{customdata[1]}<br>Cost: %{customdata[2]}"
+                    "<br>Normalization: %{customdata[3]}<extra></extra>"
+                ),
             ),
         )
         cost_drag = timeline["cost_drag"]
@@ -90,7 +100,9 @@ def plot_activity_overview(
     theme_config = get_theme_config(theme)
     fig.update_layout(theme_config["layout"])
     fig.update_layout(
-        title={"text": "Activity", "font": {"size": 16}},
+        title={"text": "Activity", "font": {"size": 13}},
+        font={"size": 14},
+        meta=activity["coverage"],
         height=350,
         yaxis={"title": "Turnover"},
         yaxis2={
@@ -133,7 +145,7 @@ def plot_activity_overview(
     # Serialize chart to HTML and combine with table
     from .tearsheet import _figure_to_clean_html
 
-    fig.update_layout(autosize=True, width=None, margin={"t": 40})
+    fig.update_layout(title=None, autosize=True, width=None, margin={"t": 40})
     chart_html = f'<div class="chart-container">{_figure_to_clean_html(fig)}</div>'
     return chart_html + table_html
 
@@ -182,9 +194,9 @@ def plot_overview_snapshot(profile: BacktestProfile, theme: str | None = None) -
         else:
             import numpy as np
 
-            cum_arr = np.array(cum_ret)
-            hwm = np.maximum.accumulate(cum_arr)
-            dd = ((cum_arr - hwm) / np.where(hwm > 0, hwm, 1.0)).tolist()
+            from ml4t.diagnostic.metrics.risk_adjusted import _drawdown_from_wealth
+
+            dd = _drawdown_from_wealth(1 + np.array(cum_ret)).tolist()
 
         fig.add_trace(
             go.Scatter(
@@ -218,7 +230,8 @@ def plot_overview_snapshot(profile: BacktestProfile, theme: str | None = None) -
 def plot_occupancy_overview(profile: BacktestProfile, theme: str | None = None) -> go.Figure:
     """Plot occupancy and realized structure diagnostics."""
     theme = validate_theme(theme)
-    timeline = profile.occupancy["timeline"]
+    occupancy = profile.occupancy
+    timeline = occupancy["timeline"]
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -228,12 +241,22 @@ def plot_occupancy_overview(profile: BacktestProfile, theme: str | None = None) 
     )
 
     if not timeline.is_empty():
+        customdata = timeline.select(
+            "equity", "gross_exposure", "net_exposure", "normalization_status"
+        ).rows()
+        hover = (
+            "%{x}<br>%{fullData.name}: %{y}<br>Equity: %{customdata[0]}"
+            "<br>Gross exposure: %{customdata[1]}<br>Net exposure: %{customdata[2]}"
+            "<br>Normalization: %{customdata[3]}<extra></extra>"
+        )
         fig.add_trace(
             go.Scatter(
                 x=timeline["timestamp"].to_list(),
                 y=timeline["gross_exposure_fraction"].to_list(),
-                mode="lines",
+                mode="lines+markers",
                 name="Gross Exposure",
+                customdata=customdata,
+                hovertemplate=hover,
             ),
             row=1,
             col=1,
@@ -242,8 +265,10 @@ def plot_occupancy_overview(profile: BacktestProfile, theme: str | None = None) 
             go.Scatter(
                 x=timeline["timestamp"].to_list(),
                 y=timeline["net_exposure_fraction"].to_list(),
-                mode="lines",
+                mode="lines+markers",
                 name="Net Exposure",
+                customdata=customdata,
+                hovertemplate=hover,
             ),
             row=1,
             col=1,
@@ -252,8 +277,10 @@ def plot_occupancy_overview(profile: BacktestProfile, theme: str | None = None) 
             go.Scatter(
                 x=timeline["timestamp"].to_list(),
                 y=timeline["open_positions"].to_list(),
-                mode="lines",
+                mode="lines+markers",
                 name="Open Positions",
+                customdata=customdata,
+                hovertemplate=hover,
             ),
             row=2,
             col=1,
@@ -261,7 +288,15 @@ def plot_occupancy_overview(profile: BacktestProfile, theme: str | None = None) 
 
     theme_config = get_theme_config(theme)
     fig.update_layout(theme_config["layout"])
-    fig.update_layout(title={"text": "Exposure", "font": {"size": 16}}, height=350)
+    fig.update_layout(
+        title={"text": "Exposure", "font": {"size": 13}},
+        height=400,
+        font={"size": 14},
+        showlegend=True,
+        legend={"orientation": "h", "y": -0.2, "font": {"size": 14}},
+        meta=occupancy["coverage"],
+    )
+    fig.update_annotations(font_size=13)
     return fig
 
 
@@ -368,11 +403,16 @@ def plot_attribution_overview(profile: BacktestProfile, theme: str | None = None
         vertical_spacing=0.12,
         row_heights=[0.56, 0.44],
     )
-    # Use contribution share (%) for cross-time comparability
-    bar_col = "pnl_contribution_share" if "pnl_contribution_share" in top.columns else "net_pnl"
-    bar_label = "PnL Contribution" if bar_col == "pnl_contribution_share" else "Net PnL"
-    bar_values = top[bar_col].to_list()
-    colors = [COLORS["positive"] if v >= 0 else COLORS["negative"] for v in bar_values]
+    bar_label = "Net P&L ($)"
+    bar_values = [v if v is not None and isfinite(v) else None for v in top["net_pnl"]]
+    colors = [
+        COLORS["positive"]
+        if v is not None and v > 0
+        else COLORS["negative"]
+        if v is not None and v < 0
+        else COLORS["neutral"]
+        for v in bar_values
+    ]
     fig.add_trace(
         go.Bar(
             x=top["symbol"].to_list(),
@@ -383,25 +423,33 @@ def plot_attribution_overview(profile: BacktestProfile, theme: str | None = None
         row=1,
         col=1,
     )
+
+    def share_values(column: str) -> list[float | str]:
+        return [v if v is not None and isfinite(v) else "N/A" for v in top[column].round(4)]
+
     fig.add_trace(
         go.Table(
             header={
+                "font": {"size": 14},
+                "height": 36,
                 "values": [
                     "Symbol",
-                    "PnL Share",
+                    "Share of net P&L",
                     "Turnover Share",
                     "Cost Share",
                     "Burden Score",
-                ]
+                ],
             },
             cells={
+                "font": {"size": 14},
+                "height": 28,
                 "values": [
                     top["symbol"].to_list(),
-                    top["pnl_contribution_share"].round(4).to_list(),
-                    top["turnover_contribution_share"].round(4).to_list(),
-                    top["cost_contribution_share"].round(4).to_list(),
+                    share_values("pnl_contribution_share"),
+                    share_values("turnover_contribution_share"),
+                    share_values("cost_contribution_share"),
                     top["burden_score"].round(4).to_list(),
-                ]
+                ],
             },
         ),
         row=2,
@@ -409,14 +457,14 @@ def plot_attribution_overview(profile: BacktestProfile, theme: str | None = None
     )
     theme_config = get_theme_config(theme)
     fig.update_layout(theme_config["layout"])
-    y_axis_config: dict[str, object] = {"title": bar_label}
-    if bar_col == "pnl_contribution_share":
-        y_axis_config["tickformat"] = ".1%"
+    y_axis_config: dict[str, object] = {"title": bar_label, "tickformat": "$,.2f"}
     fig.update_layout(
         title={"text": "Attribution", "font": {"size": 16}},
         height=380,
         yaxis=y_axis_config,
     )
+    fig.update_xaxes(tickfont={"size": 14})
+    fig.update_yaxes(tickfont={"size": 14}, title_font={"size": 14})
     return fig
 
 
@@ -499,10 +547,10 @@ def plot_stability_overview(profile: BacktestProfile, theme: str | None = None) 
         cols=2,
         shared_xaxes=True,
         subplot_titles=(
-            "Rolling Return (252d)",
-            "Rolling Sharpe (252d)",
-            "Rolling Volatility (252d)",
-            "Rolling Sortino (252d)",
+            "Rolling Return (252 observations)",
+            "Rolling Sharpe (252 observations)",
+            "Rolling Volatility (252 observations)",
+            "Rolling Sortino (252 observations)",
         ),
         vertical_spacing=0.14,
         horizontal_spacing=0.08,
@@ -549,9 +597,9 @@ def plot_stability_overview(profile: BacktestProfile, theme: str | None = None) 
         # Row 2, Col 1: Rolling Volatility (252d)
         n = len(returns)
         vol_252 = np.full(n, np.nan)
-        sqrt_252 = float(np.sqrt(252))
+        annualization_scale = float(np.sqrt(profile.periods_per_year))
         for i in range(251, n):
-            vol_252[i] = float(np.std(returns[i - 251 : i + 1], ddof=1)) * sqrt_252
+            vol_252[i] = float(np.std(returns[i - 251 : i + 1], ddof=1)) * annualization_scale
         fig.add_trace(
             go.Scatter(
                 x=x_axis,
@@ -573,7 +621,7 @@ def plot_stability_overview(profile: BacktestProfile, theme: str | None = None) 
             downside = np.minimum(window, 0.0)
             downside_std = float(np.sqrt(np.mean(downside**2)))
             if downside_std > 0:
-                sortino_252[i] = mean_r / downside_std * sqrt_252
+                sortino_252[i] = mean_r / downside_std * annualization_scale
         fig.add_trace(
             go.Scatter(
                 x=x_axis,

@@ -51,7 +51,9 @@ def plot_ic_ts(
     rolling_window : int, default 21
         Window size for rolling mean calculation
     show_significance : bool, default True
-        Show significance bands (±1.96 * std for 95% CI)
+        Show the zero-centered normal-approximation band, z * sample standard
+        deviation / sqrt(finite IC count). Undefined variance displays
+        "CI unavailable", not a band. This is not HAC-adjusted inference.
     significance_level : float, default 0.05
         Significance level for bands (0.05 = 95% CI)
     theme : str | None
@@ -159,25 +161,36 @@ def plot_ic_ts(
         line_dash="dot",
         line_color=theme_config["colorway"][2],
         annotation_text=f"Mean IC: {format_finite(mean_ic, '.4f')}",
-        annotation_position="right",
+        annotation_position="top right",
     )
 
     # Significance bands
     if show_significance:
         ic_std = ic_result.ic_std.get(period, 0)
-        z_score = stats.norm.ppf(1 - significance_level / 2)
-        upper = z_score * ic_std / np.sqrt(len(ic_series))
-        lower = -upper
-
-        fig.add_hrect(
-            y0=lower,
-            y1=upper,
-            fillcolor="gray",
-            opacity=0.1,
-            line_width=0,
-            annotation_text=f"{100 * (1 - significance_level):.0f}% CI",
-            annotation_position="top right",
-        )
+        n_finite = int(np.isfinite(ic_series).sum())
+        if n_finite >= 2 and np.isfinite(ic_std):
+            z_score = stats.norm.ppf(1 - significance_level / 2)
+            upper = z_score * ic_std / np.sqrt(n_finite)
+            fig.add_hrect(
+                y0=-upper,
+                y1=upper,
+                fillcolor="gray",
+                opacity=0.1,
+                line_width=0,
+                annotation_text=f"{100 * (1 - significance_level):.0f}% CI",
+                annotation_position="top right",
+            )
+        else:
+            fig.add_annotation(
+                text="CI unavailable",
+                xref="paper",
+                yref="paper",
+                x=0.98,
+                y=0.02,
+                xanchor="right",
+                yanchor="bottom",
+                showarrow=False,
+            )
 
     # Add summary annotation
     positive_pct = ic_result.ic_positive_pct.get(period, 0)
@@ -209,11 +222,13 @@ def plot_ic_ts(
 
     fig.update_layout(
         legend={
+            "orientation": "h",
             "yanchor": "top",
-            "y": 0.99,
-            "xanchor": "right",
-            "x": 0.99,
+            "y": -0.25,
+            "xanchor": "left",
+            "x": 0,
         },
+        margin={"b": 120},
         showlegend=True,
     )
 
@@ -494,6 +509,11 @@ def plot_monthly_ic_heatmap(
 ) -> go.Figure:
     """Plot monthly IC heatmap for seasonality analysis.
 
+    Means use the selected IC observations and each supplied timestamp's civil
+    year/month, not an inferred session calendar. Entirely unobserved month
+    columns are omitted; missing year/month cells remain unavailable. An empty
+    sample displays an unavailable notice rather than fabricated zero values.
+
     Parameters
     ----------
     ic_result : SignalICResult
@@ -554,12 +574,11 @@ def plot_monthly_ic_heatmap(
 
     df = pd.DataFrame(
         {
-            "date": parsed_dates,
+            "year": [date.year for date in parsed_dates],
+            "month": [date.month for date in parsed_dates],
             "ic": ic_series,
         }
     )
-    df["year"] = df["date"].dt.year
-    df["month"] = df["date"].dt.month
 
     # Pivot to get mean IC by year-month
     pivot = df.pivot_table(values="ic", index="year", columns="month", aggfunc="mean")
@@ -590,6 +609,18 @@ def plot_monthly_ic_heatmap(
         height=height or 400 + 30 * len(pivot),
         theme=theme,
     )
+    if pivot.empty:
+        fig.add_annotation(
+            text="Monthly IC unavailable",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return fig
 
     # Get colorscale
     try:
@@ -610,8 +641,14 @@ def plot_monthly_ic_heatmap(
     fig.add_trace(
         go.Heatmap(
             z=pivot.values,
-            x=month_names[: int(pivot.columns.max())],
+            x=[month_names[int(month) - 1] for month in pivot.columns],
             y=pivot.index.astype(str).tolist(),
+            text=[
+                [f"{value:.3f}" if np.isfinite(value) else "" for value in row]
+                for row in pivot.values
+            ],
+            texttemplate="%{text}",
+            textfont={"size": 14},
             colorscale=colors if isinstance(colors, str) else "RdBu",
             zmid=0,
             zmin=zmin,
@@ -620,20 +657,6 @@ def plot_monthly_ic_heatmap(
             hovertemplate="Year: %{y}<br>Month: %{x}<br>IC: %{z:.4f}<extra></extra>",
         )
     )
-
-    # Add text annotations
-    for _i, year in enumerate(pivot.index):
-        for _j, month in enumerate(pivot.columns):
-            val = pivot.loc[year, month]
-            if not np.isnan(val):
-                text_color = "white" if abs(val) > max_abs * 0.5 else "black"
-                fig.add_annotation(
-                    x=month_names[int(month) - 1],
-                    y=str(year),
-                    text=f"{val:.3f}",
-                    showarrow=False,
-                    font={"size": 10, "color": text_color},
-                )
 
     fig.update_layout(
         xaxis={"side": "bottom", "tickangle": 0},

@@ -588,6 +588,7 @@ class TestComputeICSeriesAndRelated:
             pred_col="prediction",
             ret_col="forward_return",
             date_col="date",
+            entity_col="asset",
         )
 
         # Should return a DataFrame with IC per date
@@ -601,6 +602,7 @@ class TestComputeICSeriesAndRelated:
             pred_col="prediction",
             ret_col="forward_return",
             date_col="date",
+            entity_col="asset",
             method="spearman",
         )
 
@@ -1509,6 +1511,7 @@ class TestComputeICDecayExtended:
             pred_col="prediction",
             price_col="close",
             date_col="date",
+            group_col="symbol",
         )
 
         assert isinstance(result, dict)
@@ -1531,6 +1534,7 @@ class TestComputeICDecayExtended:
             pred_col="prediction",
             price_col="close",
             date_col="date",
+            group_col="symbol",
         )
 
         assert isinstance(result, dict)
@@ -1548,6 +1552,7 @@ class TestComputeICDecayExtended:
                 prices,
                 horizons=[1, 5],
                 method=method,
+                group_col="symbol",
             )
             assert isinstance(result, dict)
 
@@ -1609,6 +1614,7 @@ class TestComputeICSeriesPandas:
             pred_col="prediction",
             ret_col="returns",
             date_col="date",
+            entity_col="symbol",
         )
 
         assert isinstance(result, pd.DataFrame | pl.DataFrame)
@@ -1625,6 +1631,7 @@ class TestComputeICSeriesPandas:
             pred_col="prediction",
             ret_col="returns",
             date_col="date",
+            entity_col="symbol",
             method="pearson",
         )
 
@@ -1760,6 +1767,7 @@ class TestComputeICByHorizonExtended:
             pred_col="prediction",
             price_col="close",
             date_col="date",
+            group_col="symbol",
         )
 
         assert isinstance(result, dict)
@@ -1783,6 +1791,7 @@ class TestComputeICByHorizonExtended:
             pred_col="prediction",
             price_col="close",
             date_col="date",
+            group_col="symbol",
         )
 
         assert isinstance(result, dict)
@@ -1886,6 +1895,7 @@ class TestEdgeCasesAndErrorHandling:
             pred_col="prediction",
             price_col="close",
             date_col="date",
+            group_col="symbol",
         )
 
         assert isinstance(result, dict)
@@ -2322,6 +2332,7 @@ class TestICSeriesEdgeCases:
             pred_col="prediction",
             ret_col="returns",
             date_col="date",
+            entity_col="symbol",
             min_obs=1,  # Low threshold
         )
 
@@ -2356,6 +2367,7 @@ class TestICSeriesEdgeCases:
             pred_col="prediction",
             ret_col="returns",
             date_col="date",
+            entity_col="symbol",
         )
 
         assert isinstance(result, pd.DataFrame | pl.DataFrame)
@@ -2484,6 +2496,7 @@ class TestAnalyzeFeatureOutcomeExtended:
             pred_col="prediction",
             price_col="close",
             date_col="date",
+            group_col="symbol",
             horizons=[1, 5, 10],
         )
 
@@ -2503,6 +2516,7 @@ class TestAnalyzeFeatureOutcomeExtended:
             pred_col="prediction",
             price_col="close",
             date_col="date",
+            group_col="symbol",
             include_decay=False,
         )
 

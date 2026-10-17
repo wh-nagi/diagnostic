@@ -34,6 +34,7 @@ html = generate_backtest_tearsheet(
     theme="default",
     output_path=output,
     n_trials=25,
+    periods_per_year=252,
 )
 
 assert output.exists()
@@ -45,7 +46,37 @@ The file-existence and Plotly assertions check that rendering completed.
 Inspect reported Sharpe, drawdown, and trial count against your source
 backtest; HTML generation does not validate supplied metrics.
 
+Set `periods_per_year` from the cadence of the return observations, not the
+number of observations or the rebalance frequency. Use 12 for monthly returns,
+252 for a declared daily trading-year convention, or 365 for daily continuous
+returns. The value must be a positive integer. It is a numerical convention,
+not evidence that an expected calendar/bar grid is complete.
+
+The same override is available on `BacktestTearsheet`, `export_workspaces`,
+`generate_tearsheet_from_result`, and `generate_tearsheet_from_run_artifacts`.
+Without an override, profile reports inherit the profile's annualization scale;
+raw-return reports use the documented 252-period daily convention at every
+sample length. Computed metrics, benchmark comparisons, rolling plots, factor
+analysis and statistical-validation sections use that scale. Supplied metrics
+are retained and must already use the same convention. Reports record the scale
+in their methodology section and the `ml4t-periods-per-year` HTML metadata.
+
+In 0.1.9 and earlier, raw reports with fewer than 100 observations incorrectly
+selected a 12-period scale. That published release remains unchanged; this
+correction applies to subsequent source revisions. Portfolio input alignment,
+calendar selection and full Pyfolio/Alphalens capability coverage are separate
+requirements, not guarantees established by report generation.
+
 ## Choose a template
+
+Profile attribution bars and contributor rankings use signed cash P&L. The
+table's "Share of net P&L" is a separate ratio: a losing total can give a
+losing asset a positive share, so its sign does not determine profit/loss
+colors or rankings. Undefined shares display `N/A`; defined zero cash P&L
+remains zero. Standalone share-only contributor inputs use neutral colors
+and report unavailable values explicitly.
+On narrow screens, the attribution panel scrolls horizontally to keep all table
+labels and values readable.
 
 | Template | Primary content |
 |----------|-----------------|
@@ -58,6 +89,47 @@ Use `BacktestProfile` when you have normalized trades, returns, positions,
 costs, predictions, and factor results. Use
 `generate_tearsheet_from_result` for an `ml4t-backtest` result. The integration
 normalizes the backtest object before rendering.
+
+In unreleased source after 0.1.9, `include_statistical=False` on
+`generate_tearsheet_from_result` or `generate_backtest_tearsheet` omits
+inferential validation calculations, credibility/validity panels, confidence
+intervals, minimum track record, Sharpe bootstrap and statistical summary KPIs.
+Ordinary performance, trading and descriptive drawdown analysis remain.
+The default is `True`. Previously the bridge silently ignored `False`.
+
+For contract fills, provide the declared point-value multiplier. The Backtest
+bridge uses a fill's explicit `multiplier` when present, otherwise the producer's
+trade multiplier for that asset. Conflicting trade declarations or missing,
+nonfinite or nonpositive declared multipliers raise an error. Direct
+`compute_activity_metrics` callers can supply the corresponding `trades_df`.
+Legacy inputs with no multiplier declaration retain cash-per-unit prices; they
+do not establish support for contract prices quoted in points.
+
+Filled notional is absolute quantity times execution price times multiplier.
+Slippage quoted in price points uses the same multiplier; commission is already
+cash and is not multiplied again. In the tested one-contract example, price
+100 and multiplier 50 produce $5,000 notional and 0.50 turnover against $10,000
+end-observation NAV. With 0.5 points of slippage and $2 commission, implementation
+cost is $27, not $2.50. Activity and symbol attribution use the same units and
+leave producer tables unchanged.
+
+These activity ratios use the NAV at the matched observed timestamp. They do
+not establish exchange-session aggregation, Pyfolio's average-gross-book
+denominator, or beginning-session-NAV return scenarios. Those workflows require
+separate input and calendar contracts.
+
+Trade profit factor divides gross positive lifecycle cash P&L by gross loss
+magnitude. Empty or all-flat samples have an unavailable `0/0` ratio, displayed
+as `N/A`, rather than zero or infinity. Gains without losses retain infinity;
+losses without gains retain zero. Unreleased source after 0.1.9 preserves this
+availability through native profiles, the computed Backtest bridge and reports,
+even when legacy producer metrics use zero for the missing sample. Producer
+tables and metrics remain unchanged. Existing lifecycle eligibility is retained;
+this is not the separate ratio of positive and negative period returns.
+When the default bridge prefers the producer's closed-trade statistics, an
+open-only account also has an unavailable ratio. Direct native lifecycle
+metrics can still include marked P&L through their existing all-open fallback;
+the repair does not reclassify either sample or change their trade counts.
 
 PDF export also depends on the browser and rendering packages documented in the
 [installation guide](../getting-started/installation.md).

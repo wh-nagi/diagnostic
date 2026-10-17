@@ -5,17 +5,71 @@ Simple, pure functions for data preparation.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from typing import Any
 
+import pandas as pd
 import polars as pl
 
+from ml4t.diagnostic.backends.polars_backend import PolarsBackend
 from ml4t.diagnostic.config.signal_config import QuantileMethod
 from ml4t.diagnostic.metrics.basic import (
     compute_forward_returns as compute_forward_returns_core,
 )
+from ml4t.diagnostic.signal._prepared import positive_count
+from ml4t.diagnostic.utils.validation import (
+    _align_datetime_key_resolution,
+    _validate_observation_keys,
+)
 
-if TYPE_CHECKING:
-    import pandas as pd
+
+def _signal_frame(value: pl.DataFrame | pd.DataFrame) -> pl.DataFrame:
+    if isinstance(value, pd.DataFrame):
+        return pl.from_pandas(
+            value.reset_index() if isinstance(value.index, pd.MultiIndex) else value
+        )
+    if isinstance(value, pl.DataFrame):
+        return value.clone()
+    raise TypeError("signal inputs and grids must be Pandas or Polars DataFrames")
+
+
+def _signal_inputs(
+    data: pl.DataFrame | pd.DataFrame,
+    return_columns: Sequence[str],
+    factor_col: str,
+    date_col: str,
+    asset_col: str,
+    group_col: str | None = None,
+) -> tuple[pl.DataFrame, list[str]]:
+    columns = list(return_columns) if not isinstance(return_columns, str) else []
+    if (
+        not columns
+        or any(not isinstance(column, str) for column in columns)
+        or len(set(columns)) != len(columns)
+    ):
+        raise ValueError("return_columns must be a nonempty sequence of distinct column names")
+    values = _signal_frame(data)
+    keys = list(dict.fromkeys([date_col, asset_col]))
+    _validate_observation_keys(values, keys, "signal")
+    if set(columns).intersection(
+        [*keys, factor_col, *([group_col] if group_col is not None else [])]
+    ):
+        raise ValueError("return columns must be distinct from observation/factor/group keys")
+    for name in [factor_col, *columns]:
+        if name not in values.columns:
+            raise pl.exceptions.ColumnNotFoundError(f"signal column {name!r} was not found")
+        if not values[name].dtype.is_numeric():
+            raise TypeError(f"signal {name} must contain numeric values")
+    if group_col is not None:
+        _validate_observation_keys(values, [group_col], "signal groups", unique=False)
+    return values, columns
+
+
+def precise_dates(series: pl.Series) -> list[Any]:
+    """Keep nanosecond keys distinct when exposing dates as Python objects."""
+    if isinstance(series.dtype, pl.Datetime) and series.dtype.time_unit == "ns":
+        return series.to_pandas().tolist()
+    return series.to_list()
 
 
 def ensure_polars(df: pl.DataFrame | pd.DataFrame) -> pl.DataFrame:
@@ -64,7 +118,7 @@ def filter_outliers(
     pl.DataFrame
         Data with outliers removed.
     """
-    if z_threshold <= 0:
+    if z_threshold <= 0 or data.height == 0:
         return data
 
     # Cross-sectional z-score with std=0 edge case
@@ -99,7 +153,9 @@ def quantize_factor(
     n_quantiles : int, default 5
         Number of quantiles.
     method : QuantileMethod, default QUANTILE
-        QUANTILE = equal frequency, UNIFORM = equal width.
+        QUANTILE retains legacy rank buckets; UNIFORM retains legacy equal-width
+        buckets. QCUT uses interpolated equal-frequency edges on finite factors
+        and rejects duplicate edges. No input cleaning is inferred.
     factor_col : str, default "factor"
         Factor column name.
     date_col : str, default "date"
@@ -110,6 +166,21 @@ def quantize_factor(
     pl.DataFrame
         Data with "quantile" column (1 = lowest, n = highest).
     """
+    method = QuantileMethod(method)
+    if method == QuantileMethod.QCUT:
+        n_quantiles = positive_count(n_quantiles, "n_quantiles")
+        values = data[factor_col]
+        if not values.dtype.is_numeric():
+            raise ValueError("qcut factors must be finite numeric values")
+        if values.null_count() or not values.is_finite().all():
+            raise ValueError(
+                "qcut factors must be finite; select an explicit cleaning policy first"
+            )
+        assigned = PolarsBackend.fast_quantile_assignment(
+            data.select(date_col, factor_col), factor_col, n_quantiles, by_group=date_col
+        )
+        labels = assigned[f"{factor_col}_quantile"].cast(pl.String).cast(pl.Int32)
+        return data.with_columns(labels.alias("quantile"))
     if method == QuantileMethod.QUANTILE:
         # Rank-based (equal count per quantile)
         data = data.with_columns(
@@ -177,6 +248,8 @@ def compute_forward_returns(
     pl.DataFrame
         Data with forward return columns (e.g., "1D_fwd_return").
     """
+    _validate_observation_keys(data, [date_col, asset_col], "factor")
+
     # Compute forward returns on full price history for each asset/date.
     price_with_returns = compute_forward_returns_core(
         prices,
@@ -193,6 +266,7 @@ def compute_forward_returns(
     ret_cols = [f"{p}D_fwd_return" for p in periods]
     returns_lookup = price_with_returns.select(join_cols + ret_cols)
 
+    data, returns_lookup = _align_datetime_key_resolution(data, returns_lookup, date_col)
     return data.join(returns_lookup, on=join_cols, how="left")
 
 

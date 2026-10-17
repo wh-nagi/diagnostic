@@ -241,7 +241,13 @@ def _normalize_tearsheet_metrics(
 
     computed = compute_metrics_from_result(result, calendar=calendar)
     for key, value in computed.items():
-        metrics.setdefault(key, value)
+        unavailable_profit_factor = (
+            key == "profit_factor" and isinstance(value, float) and math.isnan(value)
+        )
+        if key in ("avg_turnover", "max_turnover") or unavailable_profit_factor:
+            metrics[key] = value
+        else:
+            metrics.setdefault(key, value)
 
     if "sharpe" not in metrics and "sharpe_ratio" in metrics:
         metrics["sharpe"] = metrics["sharpe_ratio"]
@@ -256,9 +262,6 @@ def _normalize_tearsheet_metrics(
 
     if "max_drawdown" in metrics:
         metrics["max_drawdown"] = abs(float(metrics["max_drawdown"]))
-
-    if isinstance(metrics.get("profit_factor"), float) and math.isnan(metrics["profit_factor"]):
-        metrics["profit_factor"] = 0.0
 
     return metrics
 
@@ -295,7 +298,13 @@ def compute_metrics_from_result(
     calendar: str | None = None,
     confidence_intervals: bool = False,
 ) -> dict[str, Any]:
-    """Compute portfolio and trade metrics from a BacktestResult."""
+    """Compute portfolio and trade metrics from a BacktestResult.
+
+    Undefined native trade profit factor remains unavailable rather than
+    inheriting a legacy producer's zero-valued missing-sample convention.
+    An empty producer trade sample is also unavailable when native fallback
+    metrics include marked positions but the producer selects closed trades.
+    """
     profile = analyze_backtest_result(
         result=result,
         calendar=calendar,
@@ -306,7 +315,10 @@ def compute_metrics_from_result(
         ta = result.trade_analyzer
         metrics["num_trades"] = ta.num_trades
         metrics["win_rate"] = ta.win_rate
-        metrics["profit_factor"] = ta.profit_factor
+        if ta.num_trades == 0:
+            metrics["profit_factor"] = math.nan
+        elif not math.isnan(metrics["profit_factor"]):
+            metrics["profit_factor"] = ta.profit_factor
         metrics["total_fees"] = ta.total_fees
         metrics["total_commission"] = ta.total_fees
 
@@ -457,9 +469,10 @@ def generate_tearsheet_from_result(
     benchmark: Any = None,
     benchmark_name: str = "Benchmark",
     report_metadata: BacktestReportMetadata | None = None,
+    *,
+    periods_per_year: int | None = None,
 ) -> str:
-    """Generate an HTML tearsheet from a BacktestResult."""
-    del include_statistical
+    """Generate an HTML tearsheet, optionally excluding statistical inference."""
     from ml4t.diagnostic.visualization.backtest import generate_backtest_tearsheet
 
     profile = analyze_backtest_result(result, calendar=calendar, benchmark=benchmark)
@@ -472,7 +485,9 @@ def generate_tearsheet_from_result(
         effective_metadata = report_metadata.merged_with(effective_metadata)
     trades_df = result.to_trades_dataframe()
     returns = result.to_daily_returns(calendar=calendar).to_numpy()
-    tearsheet_metrics = _normalize_tearsheet_metrics(result, calendar=calendar)
+    tearsheet_metrics = (
+        _normalize_tearsheet_metrics(result, calendar=calendar) if periods_per_year is None else {}
+    )
 
     if "total_pnl" not in tearsheet_metrics and result.trades:
         tearsheet_metrics["total_pnl"] = sum(trade.pnl for trade in result.trades)
@@ -491,6 +506,8 @@ def generate_tearsheet_from_result(
         benchmark_returns=benchmark,
         benchmark_name=benchmark_name,
         report_metadata=effective_metadata,
+        periods_per_year=periods_per_year,
+        include_statistical=include_statistical,
     )
 
     if output_path is not None:
@@ -513,6 +530,7 @@ def generate_tearsheet_from_run_artifacts(
     benchmark: Any = None,
     benchmark_name: str = "Benchmark",
     report_metadata: BacktestReportMetadata | None = None,
+    periods_per_year: int | None = None,
 ) -> str:
     """Generate a tearsheet directly from backtest run artifacts."""
     from ml4t.diagnostic.visualization.backtest import generate_backtest_tearsheet
@@ -544,6 +562,7 @@ def generate_tearsheet_from_run_artifacts(
         benchmark_name=benchmark_name,
         report_metadata=effective_metadata,
         output_path=output_path,
+        periods_per_year=periods_per_year,
     )
     return html
 
