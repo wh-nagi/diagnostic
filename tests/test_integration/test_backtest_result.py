@@ -157,7 +157,7 @@ def test_portfolio_analysis_from_result_uses_feed_semantics_for_auto_alignment()
     assert [equity for _, equity in result.equity_curve] == [1000.0, 1000.0, 1040.0]
     assert result.to_daily_returns(session_aligned=False).to_list() == pytest.approx([0.0, 0.04])
     analysis = portfolio_analysis_from_result(result)
-    assert analysis.returns.tolist() == [0.0]
+    assert analysis.returns.tolist() == pytest.approx([40 / 1000])
 
 
 def test_compute_metrics_from_result_handles_empty_inputs():
@@ -366,8 +366,9 @@ def test_profile_from_run_artifacts_resolves_predictions_and_weights(tmp_path):
     assert profile.signals_df["signal_value"].to_list() == [0.2]
     assert profile.strategy_metadata["mapping_name"] == "equal_weight_top_k"
     assert profile.ml["metrics"]["translation_ready"] is True
-    assert profile.occupancy["metrics"]["time_in_market"] > 0
-    assert profile.activity["metrics"]["num_rebalance_events"] > 0
+    assert profile.occupancy["metrics"]["time_in_market"] is None
+    assert profile.activity["metrics"]["num_rebalance_events"] == 0
+    assert profile.portfolio_state_df.is_empty() and profile.fills_df.is_empty()
 
 
 def test_profile_from_run_artifacts_respects_feed_column_contract(tmp_path):

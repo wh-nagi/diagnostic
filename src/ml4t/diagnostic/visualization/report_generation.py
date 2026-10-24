@@ -29,7 +29,10 @@ Example workflow:
 """
 
 from datetime import datetime
+from html import escape
 from pathlib import Path
+from stat import S_IMODE
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import plotly.graph_objects as go
@@ -65,6 +68,7 @@ def combine_figures_to_html(
     output_file: str | Path | None = None,
     theme: str | None = None,
     include_toc: bool = True,
+    include_plotlyjs: bool | str = "cdn",
 ) -> str:
     """Combine multiple Plotly figures into a single HTML document.
 
@@ -93,6 +97,9 @@ def combine_figures_to_html(
     include_toc : bool, optional
         Whether to include a table of contents at the top of the report.
         Default is True. TOC is generated from section titles.
+    include_plotlyjs : bool | str, optional
+        Plotly's script inclusion option for the first figure. The existing
+        default uses its CDN; True embeds the library for an offline report.
 
     Returns
     -------
@@ -153,7 +160,7 @@ def combine_figures_to_html(
 
     Notes
     -----
-    - HTML is self-contained with embedded Plotly.js from CDN
+    - Use include_plotlyjs=True for a self-contained offline report
     - First figure includes full Plotly.js, subsequent figures reuse it
     - CSS styling is embedded in <style> tag
     - Reports are responsive and work on mobile devices
@@ -183,11 +190,10 @@ def combine_figures_to_html(
     # Convert figures to HTML divs
     figure_htmls = []
     for i, fig in enumerate(figures):
-        # First figure includes Plotly.js from CDN, others don't
-        include_plotlyjs = "cdn" if i == 0 else False
-
         fig_html = fig.to_html(
-            full_html=False, include_plotlyjs=include_plotlyjs, div_id=f"plot-{i}"
+            full_html=False,
+            include_plotlyjs=include_plotlyjs if i == 0 else False,
+            div_id=f"plot-{i}",
         )
         figure_htmls.append(fig_html)
 
@@ -204,7 +210,22 @@ def combine_figures_to_html(
     if output_file is not None:
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(html_content, encoding="utf-8")
+        temporary = None
+        try:
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=output_path.parent,
+                prefix=f".{output_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                stream.write(html_content)
+            temporary.replace(output_path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return str(output_path.absolute())
     else:
         return html_content
@@ -837,19 +858,29 @@ def _build_html_document(
     str
         Complete HTML document
     """
-    # Extract colors from theme
-    bg_color = theme_config.get("plot_bgcolor", _ML4T_COLORS["bg_light"])
-    text_color = theme_config.get("font_color", _ML4T_COLORS["blue"])
-    grid_color = theme_config.get("gridcolor", "#E5E5E5")
+    title = escape(str(title))
+    layout = theme_config.get("layout", {})
+    font = layout.get("font", {})
+    bg_color = layout.get("paper_bgcolor", _ML4T_COLORS["bg_light"])
+    if bg_color == "rgba(0,0,0,0)":
+        bg_color = _ML4T_COLORS["bg_light"]
+    text_color = font.get("color", _ML4T_COLORS["blue"])
+    grid_color = layout.get("xaxis", {}).get("gridcolor", "#E5E5E5")
 
     # Determine if dark theme
-    is_dark = "dark" in theme_config.get("template", "").lower() or bg_color in [
+    is_dark = theme_config.get("name") == "dark" or bg_color in [
         _ML4T_COLORS["bg_dark"],
         _ML4T_COLORS["blue_light"],
     ]
 
     # Generate CSS
-    css = _generate_css(bg_color, text_color, grid_color, is_dark)
+    css = _generate_css(
+        bg_color,
+        text_color,
+        grid_color,
+        is_dark,
+        font.get("family", "DM Sans, DejaVu Sans, sans-serif"),
+    )
 
     # Generate TOC if requested
     toc_html = ""
@@ -897,7 +928,13 @@ def _build_html_document(
     return html
 
 
-def _generate_css(bg_color: str, text_color: str, grid_color: str, is_dark: bool) -> str:
+def _generate_css(
+    bg_color: str,
+    text_color: str,
+    grid_color: str,
+    is_dark: bool,
+    font_family: str = "DM Sans, DejaVu Sans, sans-serif",
+) -> str:
     """Generate CSS styles for report."""
     # Derive additional colors
     if is_dark:
@@ -920,7 +957,7 @@ def _generate_css(bg_color: str, text_color: str, grid_color: str, is_dark: bool
         }}
 
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: {font_family};
             background-color: {bg_color};
             color: {text_color};
             line-height: 1.6;
@@ -1005,6 +1042,27 @@ def _generate_css(bg_color: str, text_color: str, grid_color: str, is_dark: bool
             line-height: 1.8;
         }}
 
+        .section-text table {{
+            border-collapse: collapse;
+            font-size: 14px;
+            width: 100%;
+            margin: 16px 0;
+        }}
+
+        .section-text th, .section-text td {{
+            padding: 8px 10px;
+            border: 1px solid {border_color};
+            text-align: right;
+        }}
+
+        .section-text th:first-child, .section-text td:first-child {{
+            text-align: left;
+        }}
+
+        .attribution-factor-statistics {{
+            min-width: 560px;
+        }}
+
         /* Plot containers */
         .plot-container {{
             margin: 30px 0;
@@ -1076,7 +1134,9 @@ def _generate_toc(sections: list[dict[str, Any]]) -> str:
         if section_title:
             # Create anchor-safe ID
             section_id = f"section-{i}"
-            toc_items.append(f'            <li><a href="#{section_id}">{section_title}</a></li>')
+            toc_items.append(
+                f'            <li><a href="#{section_id}">{escape(str(section_title))}</a></li>'
+            )
 
     toc_html = f"""        <nav class="toc">
             <h2>Table of Contents</h2>
@@ -1115,7 +1175,9 @@ def _generate_body_content(figure_htmls: list[str], sections: list[dict[str, Any
 
         # Add title if present
         if section_title:
-            section_html += f'                <h2 class="section-title">{section_title}</h2>\n'
+            section_html += (
+                f'                <h2 class="section-title">{escape(str(section_title))}</h2>\n'
+            )
 
         # Add text if present (section_text may contain HTML block elements,
         # so we don't wrap in <p> to avoid invalid nesting)
@@ -1353,11 +1415,46 @@ def _export_figures_multipage(
 
         # Merge all PDFs into single file
         writer = pdf_writer_class()
-        for pdf_path in temp_pdfs:
-            writer.append(str(pdf_path))
-
-        # Write merged PDF
-        with open(output_path, "wb") as output_file:
-            writer.write(output_file)
+        temporary = None
+        primary_error = None
+        closed = False
+        try:
+            for pdf_path in temp_pdfs:
+                writer.append(str(pdf_path))
+            with NamedTemporaryFile(
+                mode="wb",
+                dir=output_path.parent,
+                prefix=f".{output_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as output_file:
+                temporary = TempPath(output_file.name)
+                writer.write(output_file)
+            close = getattr(writer, "close", None)
+            if callable(close):
+                close()
+            closed = True
+            if output_path.exists():
+                temporary.chmod(S_IMODE(output_path.stat().st_mode))
+            temporary.replace(output_path)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                if not closed and callable(close := getattr(writer, "close", None)):
+                    close()
+            except Exception as error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(f"PDF merger close failed: {error!r}")
+            finally:
+                if temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError as error:
+                        if primary_error is None:
+                            raise
+                        primary_error.add_note(f"PDF partial output cleanup failed: {error!r}")
 
     return str(output_path.absolute())

@@ -14,9 +14,15 @@
 | Package | Purpose |
 |---------|---------|
 | [signal/](signal/AGENTS.md) | Factor signal analysis and IC/quantile workflows |
+| `compat/` | Thin Reloaded migration adapters using the native analytical kernels |
+| [utils/legacy_time.py](utils/legacy_time.py) | Explicit legacy clock conversion and return rekeying, not exchange-grid validation |
 | [metrics/](metrics/AGENTS.md) | Feature, signal, and risk metric functions |
 | [splitters/](splitters/AGENTS.md) | Walk-forward, CPCV, calendars, and fold persistence |
 | [evaluation/](evaluation/AGENTS.md) | Core analysis workflows and statistical validation |
+| `compat.pyfolio.txn`, `compat.pyfolio.utils`, `compat.pyfolio.round_trips`, `compat.pyfolio.plotting` | Thin pandas transaction/Zipline-tuple, round-trip extraction and five-table statistics adapters, plus optional Plotly transaction charts over native calculations/inputs; no legacy runtime dependency |
+| `compat.pyfolio.perf_attrib` | Supplied dollar/fractional holdings attribution and component statistics over shared native kernels; uncovered assets retain the full account NAV denominator |
+| `compat.pyfolio.pos` | Familiar position allocation, extrema, concentration, sector and marked-record projections over native holdings kernels; signed-NAV legacy definitions do not relax native validation |
+| `compat.pyfolio.capacity`, `compat.pyfolio.tears.create_capacity_tear_sheet` | Familiar fixed-capital liquidation, actual participation and hypothetical impact/report workflow; explicit intraday estimates reuse native kernels, not observed account facts |
 | [selection/](selection/AGENTS.md) | Systematic feature selection pipeline |
 | [integration/](integration/AGENTS.md) | `ml4t-backtest`, `ml4t-data`, and `ml4t-engineer` bridges |
 | [visualization/](visualization/AGENTS.md) | Plotly charts, dashboards, and tearsheets |
@@ -27,7 +33,21 @@
 ## Notes
 
 - Public API is defined by `__all__` exports in package modules.
+- `compat.empyrical` and `compat.pyfolio` adapt legacy analytical signatures over
+  native calculations. Pyfolio attribution figures and `tears.create_perf_attrib_tear_sheet`
+  use optional Plotly/HTML presentation, not a mandatory Reloaded or Matplotlib runtime.
 - Reporting and tearsheet entry points are in `integration/` and `visualization/backtest/`.
+- `compat.pyfolio.create_returns_tear_sheet` composes the familiar complete returns manifest
+  with the existing `PortfolioTearSheet` renderer, explicit availability and native kernels.
+  The plotting adapters return Plotly figures; Matplotlib artist mutation is not preserved.
+- `compat.pyfolio.create_position_tear_sheet` composes the complete familiar holdings manifest,
+  top-table/sector options and explicit intraday estimates in that renderer. Hidden identities
+  are anonymized before constructing figures or notebook/export payloads.
+- `compat.pyfolio.create_txn_tear_sheet` composes actual turnover, volume, timing and optional
+  additional-slippage panels; aware fill instants use the supplied book's civil-day timezone.
+- `compat.pyfolio.create_simple_tear_sheet` and `create_full_tear_sheet` compose supplied-account
+  workflows from those components. Full reports retain optional capacity/attribution tables and
+  actual FIFO results; they do not infer a broker history or fabricate absent inputs.
 - Correlation-adjusted DSR now lives in `evaluation.stats` via
   `effective_number_of_trials()` plus `deflated_sharpe_ratio(..., correlation_method=...)`.
 - For book and case-study workflows, set `periods_per_year` from the return

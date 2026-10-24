@@ -11,20 +11,30 @@ from hashlib import sha256
 from importlib.metadata import version
 from io import BytesIO
 from numbers import Real
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
 import polars as pl
+from ml4t.specs import UNSET_CALENDAR, CalendarUnset, FeedSpec
 
 from ml4t.diagnostic.backends.polars_backend import PolarsBackend, _bucket_parameters
+from ml4t.diagnostic.signal._prepared import prepared_snapshot, signal_input_contract
 from ml4t.diagnostic.utils.validation import (
     _align_datetime_key_resolution,
     _validate_observation_keys,
 )
 
 if TYPE_CHECKING:
+    from ml4t.diagnostic.signal.events import AlignedEventResult, EventReturnsResult
+    from ml4t.diagnostic.signal.factor_regression import FactorAlphaBetaResult
+    from ml4t.diagnostic.signal.portfolio_inputs import SyntheticPortfolioInputs
+    from ml4t.diagnostic.signal.positions import SyntheticPositionsResult
     from ml4t.diagnostic.signal.result import SignalResult
+
+
+class MaxLossExceededError(ValueError):
+    """The common sample loses more than its declared maximum fraction."""
 
 
 @dataclass(frozen=True)
@@ -36,6 +46,55 @@ class PreparedSignalPanel:
     factor_col: str
     date_col: str
     asset_col: str
+    _outcome_payload: bytes | None = field(default=None, repr=False)
+
+    @classmethod
+    def from_prepared(
+        cls,
+        data: pl.DataFrame | pd.DataFrame,
+        *,
+        return_columns: Sequence[str],
+        factor_col: str = "factor",
+        date_col: str | None = None,
+        asset_col: str | None = None,
+        timestamp_col: str | None = None,
+        entity_col: str | None = None,
+        feed_spec: FeedSpec | Mapping[str, Any] | None = None,
+        calendar: str | CalendarUnset | None = UNSET_CALENDAR,
+    ) -> PreparedSignalPanel:
+        """Own a complete supplied panel without cleaning or assigning buckets.
+
+        The existing strict prepared-input validator preserves positive sparse
+        bucket IDs and explicit outcome selectors. Nonfinite numeric values or
+        ambiguous keys fail rather than silently changing the analytical sample.
+        No price, endpoint, availability or exchange schedule is inferred.
+        """
+        date_col, asset_col, contract = signal_input_contract(
+            feed_spec=feed_spec,
+            timestamp_col=timestamp_col,
+            entity_col=entity_col,
+            date_col=date_col,
+            asset_col=asset_col,
+            calendar=calendar,
+        )
+        if len({date_col, asset_col, factor_col, "quantile"}) != 4:
+            raise ValueError("prepared keys, factor and quantile must have distinct names")
+        frame, payload, metadata = prepared_snapshot(
+            data, (), None, factor_col, date_col, asset_col, return_columns=return_columns
+        )
+        excluded = (
+            frame.select(date_col, asset_col)
+            .head(0)
+            .with_columns(
+                pl.lit(None, dtype=pl.String).alias("exclusion_stage"),
+                pl.lit(None, dtype=pl.String).alias("exclusion_reason"),
+            )
+        )
+        metadata.update(contract)
+        metadata["excluded_data_ipc_base64"] = base64.b64encode(
+            excluded.write_ipc(None).getvalue()
+        ).decode("ascii")
+        return cls(payload, json.dumps(metadata, allow_nan=False), factor_col, date_col, asset_col)
 
     @property
     def data(self) -> pl.DataFrame:
@@ -56,6 +115,15 @@ class PreparedSignalPanel:
         """
         return pl.read_ipc(BytesIO(base64.b64decode(self.metadata["excluded_data_ipc_base64"])))
 
+    @property
+    def outcome_data(self) -> pl.DataFrame | None:
+        """Return an owned long source/end/availability snapshot, when supplied."""
+        return (
+            pl.read_ipc(BytesIO(self._outcome_payload))
+            if self._outcome_payload is not None
+            else None
+        )
+
     def analyze(
         self,
         *,
@@ -64,24 +132,30 @@ class PreparedSignalPanel:
         compute_turnover_flag: bool = False,
         autocorrelation_lags: int = 10,
     ) -> SignalResult:
-        """Feed supported integer-day selectors to the existing analysis engine.
+        """Analyze this exact supplied sample, selectors and bucket IDs.
 
         These labels select supplied columns; they do not establish durations or
-        calendar conformance. Other horizon labels remain available in ``data``.
+        calendar conformance. Sparse bucket labels are retained without rebucketing.
+        Automatic persistence lags use only positive exact-day horizon labels.
         """
         from ml4t.diagnostic.signal.core import analyze_prepared_signal
 
         columns = self.metadata["return_columns"]
-        if not all(re.fullmatch(r"[1-9]\d*D", column) for column in columns):
-            raise ValueError("analysis currently requires positive integer D horizon labels")
         data = self.data
-        buckets = sorted(data["quantile"].unique().to_list())
-        if not buckets or buckets != list(range(1, max(buckets) + 1)):
-            raise ValueError("analysis requires a nonempty contiguous bucket range starting at1")
+        buckets = sorted(int(bucket) for bucket in data["quantile"].unique())
+        legacy = (
+            bool(buckets)
+            and buckets == list(range(1, max(buckets) + 1))
+            and all(re.fullmatch(r"[1-9]\d*D", column) for column in columns)
+        )
+        selection = (
+            {"periods": tuple(int(column[:-1]) for column in columns), "quantiles": max(buckets)}
+            if legacy
+            else {"return_columns": columns}
+        )
         result = analyze_prepared_signal(
             data,
-            periods=tuple(int(column[:-1]) for column in columns),
-            quantiles=max(buckets),
+            **selection,
             min_assets=min_assets,
             ic_method=ic_method,
             compute_turnover_flag=compute_turnover_flag,
@@ -89,9 +163,18 @@ class PreparedSignalPanel:
             factor_col=self.factor_col,
             date_col=self.date_col,
             asset_col=self.asset_col,
+            feed_spec=self.metadata.get("feed_spec"),
+            calendar=self.metadata.get("calendar_argument", UNSET_CALENDAR),
         )
         return replace(
-            result, preparation_metadata={**result.preparation_metadata, "cleaning": self.metadata}
+            result,
+            _outcome_data=self._outcome_payload,
+            preparation_metadata={
+                **result.preparation_metadata,
+                "calendar": self.metadata["calendar"],
+                "calendar_source": self.metadata["calendar_source"],
+                "cleaning": self.metadata,
+            },
         )
 
     def ic_by_date(
@@ -122,6 +205,66 @@ class PreparedSignalPanel:
             date_col=self.date_col,
             asset_col=self.asset_col,
             date_grid=date_grid,
+        )
+
+    def event_returns(
+        self,
+        values: pl.DataFrame | pd.DataFrame,
+        *,
+        input_kind: Literal["levels", "returns"],
+        before: int = 5,
+        after: int = 15,
+        demeaned: bool = True,
+        group_adjust: bool = False,
+        by_group: bool = False,
+        value_col: str = "value",
+    ) -> EventReturnsResult:
+        """Retain the overall and optional group samples for an event-returns report."""
+        from ml4t.diagnostic.signal.events import analyze_event_returns
+
+        return analyze_event_returns(
+            self.data,
+            values,
+            input_kind=input_kind,
+            before=before,
+            after=after,
+            demeaned=demeaned,
+            group_adjust=group_adjust,
+            by_group=by_group,
+            date_col=self.date_col,
+            asset_col=self.asset_col,
+            value_col=value_col,
+        )
+
+    def event_study(
+        self,
+        values: pl.DataFrame | pd.DataFrame,
+        *,
+        input_kind: Literal["levels", "returns"],
+        before: int = 10,
+        after: int = 15,
+        demeaned: bool = True,
+        group_adjust: bool = False,
+        by_group: bool = False,
+        mean_by_date: bool = True,
+        value_col: str = "value",
+    ) -> AlignedEventResult:
+        """Align this owned event sample without substituting an abnormal-return model."""
+        from ml4t.diagnostic.signal.events import analyze_signal_events
+
+        return analyze_signal_events(
+            self.data,
+            values,
+            input_kind=input_kind,
+            before=before,
+            after=after,
+            demeaned=demeaned,
+            group_adjust=group_adjust,
+            by_group=by_group,
+            mean_by_date=mean_by_date,
+            date_col=self.date_col,
+            asset_col=self.asset_col,
+            value_col=value_col,
         )
 
     def factor_weights(
@@ -177,6 +320,35 @@ class PreparedSignalPanel:
             asset_col=self.asset_col,
         )
 
+    def factor_alpha_beta(
+        self,
+        *,
+        annualization_factors: Mapping[str, float],
+        returns: pl.DataFrame | pd.DataFrame | pd.Series | None = None,
+        demeaned: bool = True,
+        group_adjust: bool = False,
+        equal_weight: bool = False,
+    ) -> FactorAlphaBetaResult:
+        """Regress this sample's dated factor returns against its equal-asset universe.
+
+        See compute_factor_alpha_beta for explicit compounded scales, provided
+        returns, finite joint samples, ownership and undefined-fit differences.
+        """
+        from ml4t.diagnostic.signal.factor_regression import compute_factor_alpha_beta
+
+        return compute_factor_alpha_beta(
+            self.data,
+            return_columns=self.metadata["return_columns"],
+            annualization_factors=annualization_factors,
+            returns=returns,
+            demeaned=demeaned,
+            group_adjust=group_adjust,
+            equal_weight=equal_weight,
+            factor_col=self.factor_col,
+            date_col=self.date_col,
+            asset_col=self.asset_col,
+        )
+
     def factor_cumulative_returns(
         self,
         *,
@@ -210,6 +382,108 @@ class PreparedSignalPanel:
             factor_col=self.factor_col,
             date_col=self.date_col,
             asset_col=self.asset_col,
+        )
+
+    def positions(
+        self,
+        *,
+        return_column: str,
+        expiries: pl.DataFrame | pd.DataFrame | None = None,
+        expiry_col: str = "requested_exit_time",
+        demeaned: bool = True,
+        group_adjust: bool = False,
+        equal_weight: bool = False,
+        quantiles: Sequence[int] | None = None,
+        groups: Sequence[str] | None = None,
+    ) -> SyntheticPositionsResult:
+        """Construct mathematical holdings from explicit selected outcome endpoints.
+
+        Requested endpoints are not actual executions. Wide supplied returns
+        without endpoint keys require an explicit expiries table. Calendar and
+        FeedSpec declarations are retained, never used to invent holding times.
+        """
+        from ml4t.diagnostic.signal.positions import compute_factor_positions
+
+        if return_column not in self.metadata["return_columns"]:
+            raise ValueError("return_column must select this panel's supplied return columns")
+        if expiries is None:
+            expiries = self.outcome_data
+            if expiries is None or expiry_col not in expiries.columns:
+                raise ValueError("positions require explicit expiries or outcome expiry keys")
+            expiries = expiries.filter(
+                pl.col(self.metadata["outcomes"]["horizon_col"]) == return_column
+            )
+        contract = self.metadata
+        result = compute_factor_positions(
+            self.data,
+            expiries=expiries,
+            expiry_col=expiry_col,
+            demeaned=demeaned,
+            group_adjust=group_adjust,
+            equal_weight=equal_weight,
+            quantiles=quantiles,
+            groups=groups,
+            factor_col=self.factor_col,
+            date_col=self.date_col,
+            asset_col=self.asset_col,
+            feed_spec=contract["feed_spec"],
+            **(
+                {"calendar": contract["calendar_argument"]}
+                if "calendar_argument" in contract
+                else {}
+            ),
+        )
+
+        metadata = result.metadata
+        names = ["timestamp_col", "entity_col", "feed_spec", "calendar", "calendar_source"]
+        if "calendar_argument" in contract:
+            names.append("calendar_argument")
+        metadata["input_contract"] = {key: contract[key] for key in names}
+        metadata["return_column"] = return_column
+        return replace(result, _metadata=json.dumps(metadata, allow_nan=False))
+
+    def to_portfolio_inputs(
+        self,
+        *,
+        return_column: str,
+        expiries: pl.DataFrame | pd.DataFrame | None = None,
+        expiry_col: str = "requested_exit_time",
+        demeaned: bool = True,
+        group_adjust: bool = False,
+        equal_weight: bool = False,
+        quantiles: Sequence[int] | None = None,
+        groups: Sequence[str] | None = None,
+        benchmark_column: str | None = "1D",
+        capital: float | None = None,
+        position_method: Literal["end_of_day", "legacy_event_sum"] = "end_of_day",
+        first_return: Literal["from_initial_wealth", "zero"] = "from_initial_wealth",
+    ) -> SyntheticPortfolioInputs:
+        """Compose synthetic holdings and daily supplied-outcome portfolio inputs.
+
+        Defaults retain end-of-day active holdings and the first wealth change
+        from initial wealth1. Legacy interchange is explicit: position_method
+        legacy_event_sum and first_return zero. No account execution is inferred.
+        """
+        from ml4t.diagnostic.signal.portfolio_inputs import build_factor_portfolio_inputs
+
+        positions = self.positions(
+            return_column=return_column,
+            expiries=expiries,
+            expiry_col=expiry_col,
+            demeaned=demeaned,
+            group_adjust=group_adjust,
+            equal_weight=equal_weight,
+            quantiles=quantiles,
+            groups=groups,
+        )
+        return build_factor_portfolio_inputs(
+            self.data,
+            positions=positions,
+            return_column=return_column,
+            benchmark_column=benchmark_column,
+            capital=capital,
+            position_method=position_method,
+            first_return=first_return,
         )
 
     def rank_autocorrelation(
@@ -341,6 +615,8 @@ def _frame(
     date_col: str,
     asset_col: str,
     value_col: str | None = None,
+    *,
+    extra_keys: tuple[str, ...] = (),
 ) -> pl.DataFrame:
     if isinstance(data, pd.Series):
         if value_col is None:
@@ -354,7 +630,7 @@ def _frame(
         frame = data.clone()
     else:
         raise TypeError("signal inputs must be Pandas or Polars frames, or indexed series")
-    _validate_observation_keys(frame, [date_col, asset_col], "signal panel")
+    _validate_observation_keys(frame, [date_col, asset_col, *extra_keys], "signal panel")
     if frame[date_col].dtype != pl.Date and not isinstance(frame[date_col].dtype, pl.Datetime):
         raise TypeError("signal panel dates must contain Date or Datetime values")
     return frame
@@ -362,7 +638,7 @@ def _frame(
 
 def prepare_signal_panel(
     factor: pl.DataFrame | pd.DataFrame | pd.Series,
-    forward_returns: pl.DataFrame | pd.DataFrame,
+    forward_returns: pl.DataFrame | pd.DataFrame | None = None,
     *,
     quantiles: int | Sequence[float] | np.ndarray | None = 5,
     bins: int | Sequence[float] | np.ndarray | None = None,
@@ -373,23 +649,39 @@ def prepare_signal_panel(
     binning_by_group: bool = False,
     max_loss: float = 0.35,
     factor_col: str = "factor",
-    date_col: str = "date",
-    asset_col: str = "asset",
+    date_col: str | None = None,
+    asset_col: str | None = None,
+    timestamp_col: str | None = None,
+    entity_col: str | None = None,
+    feed_spec: FeedSpec | Mapping[str, Any] | None = None,
+    calendar: str | CalendarUnset | None = UNSET_CALENDAR,
+    horizon_col: str | None = None,
+    return_col: str = "forward_return",
+    prices: pl.DataFrame | pd.DataFrame | None = None,
+    horizons: Mapping[str, int] | None = None,
+    price_basis: str | None = None,
+    price_col: str | None = None,
+    index_mode: Literal["common_grid", "per_asset"] = "common_grid",
+    endpoint_method: Literal["cumulative", "exit_bar"] = "cumulative",
+    fill_method: Literal["ffill"] | None = None,
+    return_filter_zscore: float | None = None,
+    available_at_col: str | None = None,
 ) -> PreparedSignalPanel:
-    """Select one complete supplied-return sample, then assign qcut/cut buckets.
+    """Prepare one owned outcome sample, then assign qcut/cut buckets.
 
     Losses use the original factor count and disjoint factor, return, group and
     bucketing stages. Nonfinite factors/returns and missing group observations
-    are excluded explicitly, not filled. A failed bucket group is excluded only
-    when max_loss>0; max_loss=0 exposes its actual error. No returns or calendar
-    are inferred. Existing price-based preparation defaults remain unchanged.
+    are excluded explicitly. Supplied outcomes are never recalculated or filled.
+    With prices=, an explicit research view feeds the same cleaner. A failed
+    bucket group is excluded only when max_loss>0; max_loss=0 exposes its error.
+    No calendar is inferred. Existing analyze_signal/prepare_data defaults remain.
 
     Parameters
     ----------
     factor : DataFrame or pandas Series
         Numeric factor values with unique date/asset keys. Pandas MultiIndex
         names must match the supplied key names; flat frames are also accepted.
-    forward_returns : DataFrame
+    forward_returns : DataFrame, optional
         Precomputed numeric outcomes with the same key schema. No prices are
         needed. Missing/nonfinite requested outcomes are unavailable, not zeros.
     quantiles : int or sequence, optional
@@ -420,6 +712,46 @@ def prepare_signal_panel(
     factor_col, date_col, asset_col : str
         Explicit input column/index names, distinct from group, quantile and
         the exclusion audit's exclusion_stage/exclusion_reason columns.
+    timestamp_col, entity_col : str, optional
+        Canonical key names, overriding feed metadata. Existing date_col/asset_col
+        aliases remain supported; contradictory explicit names raise.
+    feed_spec : FeedSpec or mapping, optional
+        Shared input column/time declarations retained in the owned audit.
+    calendar : str or None, optional
+        Explicit selection overrides declared metadata, then NYSE. Explicit None
+        disables calendars. This supplied-outcome route records the resolved
+        declaration without inferring or validating return endpoints or schedules.
+    horizon_col : str, optional
+        Explicit long-outcome horizon selector column. Pivot the selected named
+        horizons once before common-sample cleaning; retain original source/end/
+        availability fields in outcome_data. No Engineer installation is required.
+    return_col : str
+        Numeric long-outcome value column, default forward_return. Declared log
+        returns are rejected rather than silently treated as arithmetic returns.
+    prices : DataFrame, optional
+        Alternative to forward_returns: keyed long quotes or pandas wide prices.
+    horizons : mapping of str to int, optional
+        Named positive observation counts for prices. Defaults to1D:1,5D:5,21D:21;
+        labels select outcomes and do not establish elapsed/calendar durations.
+    price_basis : str
+        Required declared price basis when prices are supplied; no adjustment
+        is inferred or performed. price_col defaults to the feed mapping.
+    index_mode : str
+        common_grid uses the supplied union price clock; per_asset uses each
+        asset's own rows. Neither infers scheduled bars or sessions.
+    endpoint_method : str
+        cumulative uses entry-to-exit return; exit_bar uses the terminal single
+        observation interval. Exact source/reference/exit keys are retained.
+    fill_method : None or "ffill"
+        Optional analytical price view with original row/price-presence flags.
+        The view does not create observed or executable bars.
+    return_filter_zscore : float, optional
+        Nonnegative per-asset forward-return cutoff over factor analysis dates,
+        before common cleaning. This descriptive research filter uses future data.
+    available_at_col : str, optional
+        Actual price availability instants; otherwise outcome availability stays
+        unknown. Imputed or sample-filtered outcomes retain unknown availability.
+        Naive availability requires an explicit feed timezone.
 
     Returns
     -------
@@ -429,6 +761,14 @@ def prepare_signal_panel(
         Float32 input quantization cannot be recovered. Original input hashes
         precede Float64 conversion; caller objects are not modified.
     """
+    date_col, asset_col, contract = signal_input_contract(
+        feed_spec=feed_spec,
+        timestamp_col=timestamp_col,
+        entity_col=entity_col,
+        date_col=date_col,
+        asset_col=asset_col,
+        calendar=calendar,
+    )
     specification, bucket_count = _bucket_parameters(quantiles, bins, zero_aware)
     quantiles, bins = (specification, None) if bins is None else (None, specification)
     if not isinstance(binning_by_group, bool | np.bool_):
@@ -457,8 +797,72 @@ def prepare_signal_panel(
         raise ValueError(
             "signal key/value names must be distinct from group, quantile and exclusion columns"
         )
+    if (prices is None) == (forward_returns is None):
+        raise ValueError("supply prices or forward_returns, not both or neither")
     factors = _frame(factor, date_col, asset_col, factor_col)
-    returns = _frame(forward_returns, date_col, asset_col)
+    price_metadata = None
+    if prices is not None:
+        from ml4t.diagnostic.signal._price_outcomes import price_outcomes
+
+        if horizon_col is not None or return_col != "forward_return":
+            raise ValueError("horizon_col/return_col describe supplied outcomes, not prices")
+        factors, forward_returns, price_metadata = price_outcomes(
+            factors,
+            prices,
+            horizons={"1D": 1, "5D": 5, "21D": 21} if horizons is None else horizons,
+            price_basis=price_basis,
+            date_col=date_col,
+            asset_col=asset_col,
+            price_col=price_col if price_col is not None else contract["feed_spec"]["price_col"],
+            index_mode=index_mode,
+            endpoint_method=endpoint_method,
+            fill_method=fill_method,
+            return_filter_zscore=return_filter_zscore,
+            available_at_col=available_at_col,
+            contract=contract,
+        )
+        horizon_col = "horizon"
+    elif (
+        horizons is not None
+        or price_basis is not None
+        or price_col is not None
+        or fill_method is not None
+        or return_filter_zscore is not None
+        or available_at_col is not None
+        or index_mode != "common_grid"
+        or endpoint_method != "cumulative"
+    ):
+        raise ValueError("price preparation options require prices")
+    assert forward_returns is not None
+    returns = _frame(
+        forward_returns,
+        date_col,
+        asset_col,
+        extra_keys=(horizon_col,) if horizon_col is not None else (),
+    )
+    outcome_payload = None
+    outcome_metadata = None
+    if horizon_col is not None:
+        from ml4t.diagnostic.signal._outcomes import normalize_outcomes
+
+        returns, outcome_payload, outcome_metadata = normalize_outcomes(
+            returns,
+            horizon_col=horizon_col,
+            return_col=return_col,
+            return_columns=return_columns,
+            date_col=date_col,
+            asset_col=asset_col,
+        )
+        return_columns = outcome_metadata["return_columns"]
+        if "calendar" in outcome_metadata and contract["calendar_source"] != "argument":
+            if (
+                contract["calendar_source"] == "feed_spec"
+                and contract["calendar"] != outcome_metadata["calendar"]
+            ):
+                raise ValueError("outcome calendar and feed_spec calendar conflict")
+            if contract["calendar_source"] == "default":
+                contract["calendar"] = outcome_metadata["calendar"]
+                contract["calendar_source"] = "outcome_table"
     keys = [date_col, asset_col]
     columns = (
         list(return_columns)
@@ -587,7 +991,7 @@ def prepare_signal_panel(
     )
     loss_fraction = (input_rows - data.height) / input_rows
     if loss_fraction > max_loss:
-        raise ValueError(
+        raise MaxLossExceededError(
             f"max_loss {max_loss} exceeded by observed exclusion fraction {loss_fraction}; losses={losses}"
         )
     aligned_exclusions = []
@@ -597,6 +1001,7 @@ def prepare_signal_panel(
     excluded_data = pl.concat(aligned_exclusions).sort(keys)
     payload = data.write_ipc(None).getvalue()
     metadata = {
+        **contract,
         "input_rows": input_rows,
         "retained_rows": data.height,
         "loss_fraction": loss_fraction,
@@ -637,6 +1042,15 @@ def prepare_signal_panel(
         "sample_policy": "common finite factor/return/group sample before bucketing",
         "calendar_validation": "not performed; supplied labels do not establish endpoints or a schedule",
     }
+    if outcome_metadata is not None:
+        metadata["outcomes"] = outcome_metadata
+    if price_metadata is not None:
+        metadata["price_preparation"] = price_metadata
     return PreparedSignalPanel(
-        payload, json.dumps(metadata, allow_nan=False), factor_col, date_col, asset_col
+        payload,
+        json.dumps(metadata, allow_nan=False),
+        factor_col,
+        date_col,
+        asset_col,
+        outcome_payload,
     )

@@ -36,7 +36,7 @@ def _signal_frame(value: pl.DataFrame | pd.DataFrame) -> pl.DataFrame:
 def _signal_inputs(
     data: pl.DataFrame | pd.DataFrame,
     return_columns: Sequence[str],
-    factor_col: str,
+    factor_col: str | None,
     date_col: str,
     asset_col: str,
     group_col: str | None = None,
@@ -55,7 +55,7 @@ def _signal_inputs(
         [*keys, factor_col, *([group_col] if group_col is not None else [])]
     ):
         raise ValueError("return columns must be distinct from observation/factor/group keys")
-    for name in [factor_col, *columns]:
+    for name in [*([factor_col] if factor_col is not None else []), *columns]:
         if name not in values.columns:
             raise pl.exceptions.ColumnNotFoundError(f"signal column {name!r} was not found")
         if not values[name].dtype.is_numeric():
@@ -229,8 +229,8 @@ def compute_forward_returns(
 
     Forward returns are computed on the full price universe (per asset) using
     the shared core metrics implementation, then joined back to signal rows.
-    This preserves trading-day semantics when factor dates are a subset of the
-    available price dates.
+    This preserves per-asset observation shifts when factor dates are a subset
+    of price dates; it does not establish sessions or scheduled-bar completeness.
 
     Parameters
     ----------

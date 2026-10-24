@@ -33,12 +33,34 @@ from ml4t.diagnostic.signal._utils import (
     quantize_factor,
 )
 from ml4t.diagnostic.signal.core import analyze_prepared_signal, analyze_signal, prepare_data
-from ml4t.diagnostic.signal.panel import PreparedSignalPanel, prepare_signal_panel
+from ml4t.diagnostic.signal.event_study import SignalEventStudyResult, analyze_signal_event_study
+from ml4t.diagnostic.signal.events import (
+    AlignedEventResult,
+    EventReturnsResult,
+    align_event_paths,
+    analyze_event_returns,
+    analyze_signal_events,
+)
+from ml4t.diagnostic.signal.factor_regression import (
+    FactorAlphaBetaResult,
+    compute_factor_alpha_beta,
+)
+from ml4t.diagnostic.signal.information import SignalInformationResult, analyze_signal_information
+from ml4t.diagnostic.signal.panel import (
+    MaxLossExceededError,
+    PreparedSignalPanel,
+    prepare_signal_panel,
+)
 from ml4t.diagnostic.signal.portfolio import (
     compute_factor_cumulative_returns,
     compute_factor_returns,
     compute_factor_weights,
 )
+from ml4t.diagnostic.signal.portfolio_inputs import (
+    SyntheticPortfolioInputs,
+    build_factor_portfolio_inputs,
+)
+from ml4t.diagnostic.signal.positions import SyntheticPositionsResult, compute_factor_positions
 from ml4t.diagnostic.signal.quantile import (
     compute_quantile_returns,
     compute_quantile_spread,
@@ -48,6 +70,7 @@ from ml4t.diagnostic.signal.quantile import (
 )
 from ml4t.diagnostic.signal.result import SignalResult
 from ml4t.diagnostic.signal.returns import demean_signal_returns
+from ml4t.diagnostic.signal.returns_report import SignalReturnsResult, analyze_signal_returns
 from ml4t.diagnostic.signal.signal_ic import (
     compute_ic_summary,
     compute_signal_ic,
@@ -66,13 +89,31 @@ __all__ = [
     "analyze_signal",
     "analyze_prepared_signal",
     "SignalResult",
+    "SignalInformationResult",
+    "analyze_signal_information",
+    "SignalReturnsResult",
+    "analyze_signal_returns",
+    "AlignedEventResult",
+    "EventReturnsResult",
+    "analyze_event_returns",
+    "SignalEventStudyResult",
+    "analyze_signal_event_study",
+    "align_event_paths",
+    "analyze_signal_events",
     # Data preparation
     "prepare_data",
     "prepare_signal_panel",
     "PreparedSignalPanel",
+    "MaxLossExceededError",
     "compute_factor_weights",
+    "compute_factor_positions",
+    "SyntheticPositionsResult",
+    "SyntheticPortfolioInputs",
+    "build_factor_portfolio_inputs",
     "compute_factor_returns",
     "compute_factor_cumulative_returns",
+    "compute_factor_alpha_beta",
+    "FactorAlphaBetaResult",
     "filter_outliers",
     "quantize_factor",
     "QuantileMethod",

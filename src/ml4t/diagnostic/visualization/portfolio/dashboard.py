@@ -5,6 +5,7 @@ Creates comprehensive tear sheets with multiple panels.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import dataclass, field
 from html import escape
@@ -25,10 +26,30 @@ from ml4t.diagnostic.visualization.core import (
 
 if TYPE_CHECKING:
     from ml4t.diagnostic.evaluation.portfolio_analysis import (
+        CapacityAnalysisResult,
         HoldingsAnalysisResult,
         PortfolioAnalysis,
         PortfolioMetrics,
+        PortfolioRegimeResult,
+        RoundTripResult,
+        RoundTripStatisticsResult,
+        TransactionAnalysisResult,
+        WealthConeResult,
     )
+
+
+def _display_figure(original: go.Figure) -> go.Figure:
+    """Project categorical display labels without changing typed native payloads."""
+    rendered = go.Figure(original)
+    if (rendered.layout.meta or {}).get("analysis") in {
+        "prepared_holdings",
+        "prepared_intraday",
+        "estimated_intraday",
+    } and rendered.layout.yaxis.type == "category":
+        for trace in rendered.data:
+            if trace.y is not None:
+                trace.y = [None if value is None else str(value) for value in trace.y]
+    return rendered
 
 
 @dataclass
@@ -46,12 +67,21 @@ class PortfolioTearSheet:
         availability: Component statuses and reasons for unavailable/disabled analysis
     """
 
-    metrics: PortfolioMetrics
+    metrics: PortfolioMetrics | None
     figures: dict[str, go.Figure] = field(default_factory=dict)
     html_content: str | None = None
     _analysis: PortfolioAnalysis | None = None
     holdings: HoldingsAnalysisResult | None = None
     availability: dict[str, dict[str, Any]] = field(default_factory=dict)
+    transactions: TransactionAnalysisResult | None = None
+    capacity: CapacityAnalysisResult | None = None
+    round_trips: RoundTripResult | None = None
+    round_trip_statistics: RoundTripStatisticsResult | None = None
+    round_trip_attribution: pl.DataFrame | None = None
+    intraday: HoldingsAnalysisResult | None = None
+    stress: PortfolioRegimeResult | None = None
+    live: PortfolioRegimeResult | None = None
+    wealth_cones: WealthConeResult | None = None
 
     def _availability_html(self) -> str:
         if not self.availability:
@@ -67,6 +97,25 @@ class PortfolioTearSheet:
             "<p>Panels describe the supplied observations. Missing analysis is not zero risk.</p>"
             f"<ul>{notes}</ul></section>"
         )
+
+    def _prepared_tables_html(self) -> list[str]:
+        """Render the same prepared tables in notebook and saved HTML views."""
+        tables = []
+        if self.stress is not None or self.live is not None:
+            from .regime_plots import regime_tables_html
+
+            for title, regimes in (("Stress windows", self.stress), ("Live split", self.live)):
+                if regimes is not None:
+                    tables.append(regime_tables_html(regimes, title))
+        if self.capacity is not None:
+            from .capacity_plots import _capacity_tables
+
+            tables.append(_capacity_tables(self.capacity))
+        if self.round_trip_statistics is not None:
+            from .round_trip_plots import _round_trip_tables_html
+
+            tables.append(_round_trip_tables_html(self.round_trip_statistics))
+        return tables
 
     def show(self, compact: bool = False) -> None:
         """Display tear sheet in Jupyter notebook or browser.
@@ -90,21 +139,28 @@ class PortfolioTearSheet:
         try:
             from IPython.display import HTML, display
 
-            display(HTML(f"<pre>{escape(self.metrics.summary())}</pre>"))
+            if self.metrics is not None:
+                display(HTML(f"<pre>{escape(self.metrics.summary())}</pre>"))
             if self.availability:
                 display(HTML(self._availability_html()))
+            for tables in self._prepared_tables_html():
+                display(HTML(tables))
             for fig in self.figures.values():
-                fig.show()
+                _display_figure(fig).show()
         except ImportError:
             # Terminal fallback: print metrics, show each figure
-            print(self.metrics.summary())
+            if self.metrics is not None:
+                print(self.metrics.summary())
+            if self.round_trip_statistics is not None:
+                for name, table in self.round_trip_statistics.tables.items():
+                    print(name, table, sep="\n")
             for name, info in self.availability.items():
                 if info.get("reason") or info["status"] != "available":
                     print(f"{name.replace('_', ' ')}: {info['status']}. {info.get('reason') or ''}")
             print()
             for name, fig in self.figures.items():
                 print(f"\n  {name}")
-                fig.show()
+                _display_figure(fig).show()
 
     def save_html(
         self,
@@ -153,6 +209,7 @@ class PortfolioTearSheet:
             padding: 20px;
             margin-bottom: 20px;
             box-shadow: 0 2px 4px rgba(10,22,40,0.08);
+            overflow-wrap: anywhere;
         }}
         .metrics-summary pre {{
             font-family: 'JetBrains Mono', 'Monaco', 'Consolas', monospace;
@@ -162,7 +219,7 @@ class PortfolioTearSheet:
             white-space: pre-wrap;
             overflow-wrap: anywhere;
         }}
-        .plot-container {{
+        body > .plot-container {{
             background: white;
             border-radius: 8px;
             padding: 15px;
@@ -175,12 +232,15 @@ class PortfolioTearSheet:
             border-bottom: 2px solid {COLORS["amber"]};
             padding-bottom: 10px;
         }}
-        h2 {{
+        h2, h3 {{
             color: {COLORS["slate"]};
             margin-top: 0;
             font-size: 16px;
         }}
         .figure-note {{ font-size: 13px; line-height: 1.5; }}
+        .capacity-table {{ border-collapse: collapse; font: inherit; font-size: 14px; }}
+        .capacity-table th, .capacity-table td {{ padding: 6px 8px; text-align: left;
+            border-bottom: 1px solid {COLORS["silver"]}; white-space: nowrap; }}
     </style>
 </head>
 <body>
@@ -188,7 +248,8 @@ class PortfolioTearSheet:
 """)
 
         # Add metrics summary
-        html_parts.append(f"""
+        if self.metrics is not None:
+            html_parts.append(f"""
     <div class="metrics-summary">
         <h2>Performance Summary</h2>
         <pre>{escape(self.metrics.summary())}</pre>
@@ -196,11 +257,12 @@ class PortfolioTearSheet:
 """)
 
         html_parts.append(self._availability_html())
+        html_parts.extend(self._prepared_tables_html())
 
         # Add each figure
         for name, fig in self.figures.items():
             description = (fig.layout.meta or {}).get("description", "")
-            fig = go.Figure(fig).update_layout(title=None)
+            fig = _display_figure(fig).update_layout(title=None)
             fig_html = fig.to_html(
                 include_plotlyjs=include_plotlyjs
                 if name == list(self.figures.keys())[0]
@@ -238,6 +300,9 @@ class PortfolioTearSheet:
     def get_figures(self) -> dict[str, go.Figure]:
         """Get dictionary of all figures.
 
+        Raw figure payloads retain native ID types. Report show/save_html applies
+        lossless categorical display labels to a copy before browser rendering.
+
         Returns
         -------
         dict[str, go.Figure]
@@ -254,28 +319,55 @@ class PortfolioTearSheet:
             Contains metrics and figure data
         """
         from .holdings_plots import _holdings_records
+        from .round_trip_plots import _round_trip_export
 
-        holdings = (
-            None
-            if self.holdings is None
-            else {
-                "positions": _holdings_records(self.holdings.positions),
-                "timeline": _holdings_records(self.holdings.timeline),
-                "sectors": _holdings_records(self.holdings.sectors),
-                "metrics": deepcopy(self.holdings.metrics),
-                "coverage": deepcopy(self.holdings.coverage),
-                "snapshot_kind": self.holdings.snapshot_kind,
+        def holdings_dict(prepared: HoldingsAnalysisResult | None) -> dict[str, Any] | None:
+            if prepared is None:
+                return None
+            return {
+                "positions": _holdings_records(prepared.positions),
+                "timeline": _holdings_records(prepared.timeline),
+                "sectors": _holdings_records(prepared.sectors),
+                "metrics": deepcopy(prepared.metrics),
+                "coverage": deepcopy(prepared.coverage),
+                "snapshot_kind": prepared.snapshot_kind,
+                "metadata": deepcopy(prepared.metadata),
                 "top_positions": {
-                    side: self.holdings.top_positions(side=side).to_dicts()
+                    side: prepared.top_positions(side=side).to_dicts()
                     for side in ["long", "short", "absolute"]
                 },
             }
-        )
+
         return {
-            "metrics": self.metrics.to_dict(),
+            "metrics": self.metrics.to_dict() if self.metrics is not None else None,
             "figures": {name: fig.to_dict() for name, fig in self.figures.items()},
-            "holdings": holdings,
+            "holdings": holdings_dict(self.holdings),
+            "intraday": holdings_dict(self.intraday),
             "availability": deepcopy(self.availability),
+            "capacity": None if self.capacity is None else json.loads(self.capacity.to_json()),
+            "round_trips": _round_trip_export(self),
+            "stress": None if self.stress is None else json.loads(self.stress.to_json()),
+            "live": None if self.live is None else json.loads(self.live.to_json()),
+            "wealth_cones": None
+            if self.wealth_cones is None
+            else json.loads(self.wealth_cones.to_json()),
+            "transactions": None
+            if self.transactions is None
+            else {
+                "timeline": _holdings_records(self.transactions.timeline),
+                "scenarios": _holdings_records(self.transactions.scenarios),
+                "metrics": deepcopy(self.transactions.metrics),
+                "metadata": deepcopy(self.transactions.metadata),
+                "observations": _holdings_records(self.transactions.observations),
+                "executions": [
+                    {**row, "timestamp": timestamp}
+                    for row, timestamp in zip(
+                        self.transactions.executions.to_dicts(),
+                        self.transactions.executions["timestamp"].cast(pl.String).to_list(),
+                        strict=True,
+                    )
+                ],
+            },
         }
 
 
@@ -289,6 +381,12 @@ def create_portfolio_dashboard(
     width: int | None = None,
     *,
     holdings: HoldingsAnalysisResult | None = None,
+    transactions: TransactionAnalysisResult | None = None,
+    capacity: CapacityAnalysisResult | None = None,
+    intraday: HoldingsAnalysisResult | None = None,
+    stress: PortfolioRegimeResult | None = None,
+    live: PortfolioRegimeResult | None = None,
+    wealth_cones: WealthConeResult | None = None,
 ) -> PortfolioTearSheet:
     """Create a return dashboard with optional prepared holdings.
 
@@ -311,7 +409,7 @@ def create_portfolio_dashboard(
     include_positions : bool, default True
         Render explicit holdings, or record why preparation is required
     include_transactions : bool, default True
-        Record the request; transaction reporting here remains unavailable
+        Render explicitly prepared transactions, or explain missing preparation
     include_benchmark : bool, default True
         Include benchmark comparison (if benchmark available)
     height_per_row : int, default 300
@@ -322,6 +420,17 @@ def create_portfolio_dashboard(
         Explicitly prepared complete holdings on this analysis's exact observation
         keys. Computed analytics are rendered without inferring NAV or positions.
         Requested but absent results have an explicit availability reason.
+    transactions : TransactionAnalysisResult, optional
+        Prepared actual execution activity and incremental-cost scenarios.
+    capacity : CapacityAnalysisResult, optional
+        Prepared supplied-market liquidity and hypothetical capital scenarios.
+        Exact observation keys and any supplied returns must match this analysis.
+    intraday : HoldingsAnalysisResult, optional
+        Explicit complete intraday snapshots on their own observation clock.
+        They are not resampled or joined onto return/EOD observations. Reported
+        maxima describe this supplied sample, not continuous-time peak exposure.
+        Explicit estimated_intraday projections instead use daily labels and
+        distinct estimated panels; they are not promoted to observed account facts.
 
     Returns
     -------
@@ -343,12 +452,91 @@ def create_portfolio_dashboard(
         "positions": {"status": "not_requested", "reason": "Position analysis was not requested."},
         "transactions": {
             "status": "unavailable" if include_transactions else "not_requested",
-            "reason": "Prepared transaction reporting is not implemented in this dashboard."
+            "reason": "Supply transactions=analysis.compute_transaction_analysis(); actual fills and denominator methods are not inferred."
             if include_transactions
             else "Transaction analysis was not requested.",
         },
     }
+    if analysis.input_data is not None:
+        flows = analysis.input_data.metadata.get("source", {}).get("capital_flows")
+        if flows is not None:
+            total = sum(event["cash_delta"] for event in flows)
+            availability["external_capital_flows"] = {
+                "status": "available",
+                "reason": f"{len(flows)} supplied external capital events; net cash flow {total:g} "
+                "in account currency. Reported NAV includes these flows; investment wealth "
+                "uses the producer's flow-adjusted net returns without subtracting fees again.",
+                "events": deepcopy(flows),
+                "net_cash_flow": total,
+            }
     prepared = None
+    prepared_transactions = None
+    if capacity is not None:
+        from ml4t.diagnostic.evaluation.portfolio_analysis import CapacityAnalysisResult
+
+        if not isinstance(capacity, CapacityAnalysisResult):
+            raise TypeError("capacity must be a prepared CapacityAnalysisResult")
+        dates = capacity.timeline["date"]
+        if dates.dtype != analysis.dates.dtype or not dates.equals(analysis.dates):
+            raise ValueError("capacity must match the exact analysis observation keys")
+        if not capacity.observations.is_empty() and not capacity.observations.equals(
+            pl.DataFrame({"date": analysis.dates, "return": analysis.returns})
+        ):
+            raise ValueError("capacity must match the exact analysis return observations")
+    prepared_intraday = None
+    from .regime_plots import (
+        regime_figures,
+        validate_cone_result,
+        validate_regime_result,
+        wealth_cone_figure,
+    )
+
+    prepared_stress = None if stress is None else validate_regime_result(analysis, stress, "stress")
+    prepared_live = None if live is None else validate_regime_result(analysis, live, "live")
+    prepared_cones = None if wealth_cones is None else validate_cone_result(analysis, wealth_cones)
+    for name, prepared_result in (
+        ("stress", prepared_stress),
+        ("live", prepared_live),
+        ("wealth_cones", prepared_cones),
+    ):
+        availability[name] = {
+            "status": "not_requested" if prepared_result is None else "available",
+            "reason": "Supply the corresponding explicitly prepared native result."
+            if prepared_result is None
+            else None,
+        }
+    if intraday is not None:
+        from ml4t.diagnostic.evaluation.portfolio_analysis import HoldingsAnalysisResult
+
+        if not isinstance(intraday, HoldingsAnalysisResult):
+            raise TypeError("intraday must be a prepared HoldingsAnalysisResult")
+        estimated = intraday.snapshot_kind == "estimated_intraday"
+        valid_clock = isinstance(intraday.timeline["date"].dtype, pl.Datetime) or (
+            estimated and intraday.timeline["date"].dtype == pl.Date
+        )
+        if intraday.snapshot_kind not in {"intraday", "estimated_intraday"} or not valid_clock:
+            raise ValueError(
+                "intraday requires actual Datetime instants, or an explicitly labeled estimated_intraday daily projection; EOD/date labels cannot become observed intraday peaks"
+            )
+        prepared_intraday = deepcopy(intraday)
+        availability["intraday"] = {
+            "status": "available" if intraday.timeline.height else "empty",
+            "reason": "Explicit retrospective daily transaction-notional estimate; not observed or reconstructed marked account peaks."
+            if estimated
+            else "Independent supplied intraday clock; no return/EOD resampling. Maximum "
+            "over supplied observations, not a continuous-time maximum. Means/time-in-market "
+            "describe observations, not elapsed-time weighting.",
+        }
+    if include_transactions and transactions is not None:
+        from ml4t.diagnostic.evaluation.portfolio_analysis import TransactionAnalysisResult
+
+        if not isinstance(transactions, TransactionAnalysisResult):
+            raise TypeError("transactions must be a prepared TransactionAnalysisResult")
+        expected = pl.DataFrame({"date": analysis.dates, "return": analysis.returns})
+        if not transactions.observations.equals(expected):
+            raise ValueError("transactions must match the exact analysis return observations")
+        prepared_transactions = deepcopy(transactions)
+        availability["transactions"] = {"status": "available", "reason": None}
     if include_positions:
         if holdings is None:
             availability["positions"] = {
@@ -494,6 +682,59 @@ def create_portfolio_dashboard(
         )
         figures.update(position_figures)
         availability.update(position_availability)
+    if prepared_transactions is not None:
+        from .transaction_plots import _transaction_figures
+
+        transaction_figures, transaction_availability = _transaction_figures(
+            prepared_transactions, theme, height_per_row, width
+        )
+        figures.update(transaction_figures)
+        availability.update(transaction_availability)
+    if capacity is not None:
+        from .capacity_plots import _capacity_figures
+
+        capacity_figures, capacity_availability = _capacity_figures(
+            capacity, theme, height_per_row, width, analysis._periods_per_year, analysis._risk_free
+        )
+        figures.update(capacity_figures)
+        availability.update(capacity_availability)
+    if prepared_intraday is not None and prepared_intraday.timeline.height:
+        from .holdings_plots import _holdings_figures
+
+        intraday_figures, intraday_availability = _holdings_figures(
+            prepared_intraday, theme, height_per_row, width, sample_axis=True
+        )
+        for name, fig in intraday_figures.items():
+            estimated = prepared_intraday.snapshot_kind == "estimated_intraday"
+            meta = dict(fig.layout.meta or {})
+            meta.update(
+                analysis="estimated_intraday" if estimated else "prepared_intraday",
+                description=(
+                    "Retrospective daily transaction-notional estimate, not observed positions or continuous marked peaks. Daily labels are not intraday instants; selected execution times and exact sample membership stay in the export. "
+                    if estimated
+                    else "Independent prepared intraday observations; no EOD/return-grid compression. "
+                    "Maxima describe the observed sample, not continuous-time peaks. "
+                    "Time-series axes show observation order, not elapsed spacing; exact instants remain on hover/export. "
+                )
+                + meta.get("description", ""),
+            )
+            fig.update_layout(meta=meta)
+            figures[("Estimated Intraday " if estimated else "Intraday ") + name] = fig
+        availability.update(
+            {"intraday_" + name: value for name, value in intraday_availability.items()}
+        )
+    if prepared_stress is not None:
+        figures.update(
+            regime_figures(prepared_stress, "Stress samples", theme, height_per_row, width)
+        )
+    if prepared_live is not None:
+        figures.update(
+            regime_figures(prepared_live, "Live regime samples", theme, height_per_row, width)
+        )
+    if prepared_cones is not None:
+        figures["Training-only wealth cones"] = wealth_cone_figure(
+            prepared_cones, theme, height_per_row, width
+        )
     for name, fig in figures.items():
         fig.update_layout(font_size=14, title_font_size=16, legend_font_size=14)
         fig.update_xaxes(tickfont_size=14, title_font_size=14)
@@ -520,6 +761,12 @@ def create_portfolio_dashboard(
         _analysis=analysis,
         holdings=prepared,
         availability=availability,
+        transactions=prepared_transactions,
+        capacity=capacity,
+        intraday=prepared_intraday,
+        stress=prepared_stress,
+        live=prepared_live,
+        wealth_cones=prepared_cones,
     )
 
 

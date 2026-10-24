@@ -7,14 +7,49 @@ from importlib.metadata import version
 import numpy as np
 import pandas as pd
 
+from ml4t.diagnostic.compat.alphalens import performance as al_performance
+from ml4t.diagnostic.compat.alphalens import utils as al
 from ml4t.diagnostic.evaluation import PortfolioAnalysis
 from ml4t.diagnostic.metrics import compute_forward_returns
 from ml4t.diagnostic.signal import prepare_signal_panel
 
 
-def main(*, plots: bool = False) -> None:
+def subday_analysis(*, plots: bool) -> dict:
+    dates = pd.date_range("2025-07-07T14:30Z", periods=4, freq="30min")
+    index = pd.MultiIndex.from_product([dates, list("ABCD")], names=["date", "asset"])
+    factor = pd.Series(np.tile([-3.0, -1.0, 1.0, 3.0], 4), index=index, name="factor")
+    outcomes = pd.DataFrame(
+        {"30m": np.tile([-0.02, 0.0, 0.02, 0.04], 4) + np.repeat([0, 0.01, -0.01, 0.02], 4)},
+        index=index,
+    )
+    panel = prepare_signal_panel(factor, outcomes, quantiles=None, bins=[-10, -5, 0, 5], max_loss=0)
+    result = panel.analyze(min_assets=4, compute_turnover_flag=True)
+    assert result.horizon_labels == ("30m",) and result.quantile_ids == (2, 3)
+    assert result.turnover == {}  # No daily lag inferred from the supplied subday selector.
+    np.testing.assert_allclose(list(result.quantile_returns["30m"].values()), [-0.005, 0.035])
+    plotted = None
+    if plots:
+        from ml4t.diagnostic.visualization.signal import plot_quantile_returns_bar
+
+        figure = plot_quantile_returns_bar(result.to_quantile_result(), period="30m")
+        assert list(figure.data[0].x) == ["Q2", "Q3"]
+        np.testing.assert_allclose(figure.data[0].y, [-0.005, 0.035])
+        plotted = {"labels": list(figure.data[0].x), "means": list(figure.data[0].y)}
+    return {
+        "supplied_horizons": result.horizon_labels,
+        "bucket_ids": result.quantile_ids,
+        "means": result.quantile_returns,
+        "spread": result.spread,
+        "automatic_turnover_lags": result.preparation_metadata["automatic_turnover_lags"],
+        "plotted": plotted,
+        "limit": "Supplied selectors; return endpoints/calendar not validated by ingestion",
+    }
+
+
+def main(*, plots: bool = False, engineer_outcomes: bool = False) -> None:
     dates = pd.bdate_range("2025-01-02", periods=6, tz="UTC")
     assets = ["A", "B", "C", "D"]
+    asset_groups = {"A": "first", "B": "first", "C": "second", "D": "second"}
     prices = pd.DataFrame(
         {
             asset: [100.0 + 11 * i + 3 * day + ((day * (i + 2)) % 7) for day in range(6)]
@@ -34,14 +69,97 @@ def main(*, plots: bool = False) -> None:
     forward = forward.set_index(["date", "asset"])[["fwd_ret_1", "fwd_ret_2"]].rename(
         columns={"fwd_ret_1": "1D", "fwd_ret_2": "2D"}
     )
+    shifted_returns = al.backshift_returns_series(factor, N=1)
+    np.testing.assert_allclose(
+        shifted_returns,
+        forward["1D"].reindex(shifted_returns.index),
+        rtol=1e-12,
+        atol=1e-14,
+    )
+    legacy_clock = al.infer_trading_calendar(factor.index.levels[0], prices.index)
+    assert (
+        al.add_custom_calendar_timedelta(
+            input=dates[0],
+            timedelta=pd.Timedelta("1D"),
+            freq=legacy_clock,
+        )
+        == dates[1]
+    )
     panel = prepare_signal_panel(
         factor,
         forward,
         quantiles=2,
-        groups={"A": "first", "B": "first", "C": "second", "D": "second"},
+        groups=asset_groups,
         max_loss=0.5,
     )
+    price_panel = prepare_signal_panel(
+        factor,
+        prices=marks,
+        horizons={"1D": 1, "2D": 2},
+        price_basis="raw",
+        calendar=None,
+        groups=asset_groups,
+        quantiles=2,
+        max_loss=0.5,
+    )
+    assert price_panel.data.equals(panel.data)
+    assert price_panel.outcome_data["window_unit"].unique().to_list() == ["observation"]
+    synthetic_positions = price_panel.positions(return_column="1D", group_adjust=True)
+    synthetic_inputs = price_panel.to_portfolio_inputs(
+        return_column="1D",
+        group_adjust=True,
+        capital=1000,
+    )
+    synthetic_analysis = synthetic_inputs.analyze(periods_per_year=365)
+    synthetic_report = synthetic_analysis.create_tear_sheet() if plots else None
+    adapted = al.get_clean_factor_and_forward_returns(
+        factor,
+        prices,
+        periods=(1, 2),
+        quantiles=2,
+        filter_zscore=None,
+        groupby=asset_groups,
+        max_loss=0.5,
+        price_basis="raw",
+        calendar=None,
+    )
+    assert adapted.attrs["diagnostic"]["loss_by_stage"] == panel.metadata["loss_by_stage"]
+    adapted_native = adapted.rename(columns={"factor_quantile": "quantile"}).reset_index()
+    native = panel.data.to_pandas()
+    pd.testing.assert_frame_equal(
+        adapted_native[native.columns],
+        native,
+        check_dtype=False,
+        check_categorical=False,
+    )
     assert panel.data.height == 12
+    # A named elapsed-duration legacy convention differs from the price panel's
+    # actual next-observation endpoints across weekends. Compare like clocks.
+    explicit_expiries = adapted.reset_index()[["date", "asset"]]
+    explicit_expiries["requested_exit_time"] = explicit_expiries["date"] + pd.Timedelta("1D")
+    legacy_inputs = panel.to_portfolio_inputs(
+        return_column="1D",
+        expiries=explicit_expiries,
+        group_adjust=True,
+        first_return="zero",
+        position_method="legacy_event_sum",
+        capital=1000,
+    ).to_pyfolio()
+    adapted_inputs = al_performance.create_pyfolio_input(
+        adapted,
+        "1D",
+        group_neutral=True,
+        capital=1000,
+        calendar=None,
+    )
+    pd.testing.assert_series_equal(adapted_inputs[0], legacy_inputs[0], check_freq=False)
+    pd.testing.assert_frame_equal(adapted_inputs[1], legacy_inputs[1], check_freq=False)
+    pd.testing.assert_series_equal(adapted_inputs[2], legacy_inputs[2], check_freq=False)
+    bucket_sample = panel.data.to_pandas().set_index(["date", "asset"])
+    direct_buckets = al.quantize_factor(bucket_sample, quantiles=2)
+    np.testing.assert_array_equal(
+        direct_buckets.reindex(bucket_sample.index), bucket_sample["quantile"]
+    )
     assert panel.metadata["loss_by_stage"] == {
         "factor": 4,
         "returns": 8,
@@ -49,6 +167,57 @@ def main(*, plots: bool = False) -> None:
         "bucketing": 0,
     }
     result = panel.analyze(min_assets=2, compute_turnover_flag=True, autocorrelation_lags=2)
+    producer_evidence = None
+    if engineer_outcomes:
+        import polars as pl
+        from ml4t.engineer.labeling import forward_returns
+        from ml4t.specs import FeedSpec
+
+        feed = FeedSpec(
+            timestamp_col="date", entity_col="asset", time_contract_version=2, calendar=None
+        )
+        outcomes = forward_returns(
+            pl.from_pandas(marks).lazy(),
+            horizons={"1D": 1, "2D": 2},
+            price_basis="raw",
+            entries=pl.from_pandas(factor.reset_index()).select("date", "asset"),
+            feed_spec=feed,
+            missing_price_policy="null",
+        ).collect()
+        produced = prepare_signal_panel(
+            factor,
+            outcomes,
+            horizon_col="horizon",
+            feed_spec=feed,
+            groups=asset_groups,
+            quantiles=2,
+            max_loss=0.5,
+        )
+        actual = produced.data.sort("date", "asset")
+        expected = panel.data.sort("date", "asset")
+        assert actual.select(pl.col("date").dt.cast_time_unit("ns"), "asset").equals(
+            expected.select(pl.col("date").dt.cast_time_unit("ns"), "asset")
+        )
+        np.testing.assert_array_equal(actual["quantile"], expected["quantile"])
+        np.testing.assert_allclose(
+            actual.select("1D", "2D").to_numpy(),
+            expected.select("1D", "2D").to_numpy(),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        assert produced.analyze(min_assets=2).outcome_data.equals(produced.outcome_data)
+        produced_positions = produced.positions(return_column="1D", group_adjust=True)
+        assert produced_positions.positions.equals(synthetic_positions.positions)
+        produced_portfolio = produced.to_portfolio_inputs(
+            return_column="1D", group_adjust=True, capital=1000
+        )
+        assert produced_portfolio.returns.equals(synthetic_inputs.returns)
+        producer_evidence = {
+            "engineer_version": version("ml4t-engineer"),
+            "outcomes": json.loads(produced.outcome_data.write_json()),
+            "same_retained_rows": produced.data.height,
+            "endpoint_unit": "observation; labels are not elapsed durations",
+        }
     assert result.n_dates == 3 and result.n_assets == 4
     assert sum(result.count_by_quantile.values()) == 12
     ic_component = result.to_ic_result()
@@ -64,6 +233,16 @@ def main(*, plots: bool = False) -> None:
     gross = weights.to_pandas().groupby("date")["weight"].agg(lambda values: values.abs().sum())
     np.testing.assert_allclose(gross, [1.0] * 3, atol=1e-14, rtol=0)
     portfolio_returns = panel.factor_returns(group_adjust=True)
+    factor_regression = panel.factor_alpha_beta(
+        annualization_factors={"1D": 252, "2D": 126},
+        group_adjust=True,
+    )
+    assert factor_regression.statistics["n_obs"].to_list() == [3, 3]
+    assert factor_regression.observations.height == 6
+    for row in factor_regression.statistics.iter_rows(named=True):
+        assert row["annual_alpha"] == np.expm1(
+            np.log1p(row["alpha_per_period"]) * row["annualization_factor"]
+        )
     one_period = portfolio_returns.to_pandas()
     one_period = one_period[one_period["return_column"] == "1D"].set_index("date")[
         "weighted_return"
@@ -153,6 +332,25 @@ def main(*, plots: bool = False) -> None:
                     name: version(name) for name in ["ml4t-diagnostic", "pandas", "numpy", "polars"]
                 },
                 "input_rows": panel.metadata["input_rows"],
+                "subday_sparse_analysis": subday_analysis(plots=plots),
+                "optional_native_outcome_producer": producer_evidence,
+                "native_price_preparation": price_panel.metadata["price_preparation"],
+                "synthetic_portfolio": {
+                    "allocation_rows": synthetic_positions.allocations.height,
+                    "event_rows": synthetic_positions.timeline.height,
+                    "daily_returns": synthetic_inputs.returns.to_dicts(),
+                    "daily_valuations": synthetic_inputs.valuations.to_dicts(),
+                    "definitions": synthetic_inputs.metadata,
+                    "annualization_factor": 365,
+                    "report_figures": list(synthetic_report.figures) if synthetic_report else None,
+                    "legacy_interchange_clock": "explicit elapsed1D, not native next-observation expiry",
+                },
+                "legacy_return_alignment": {
+                    "shifted_rows": len(shifted_returns),
+                    "clock": "common observed date levels",
+                    "first_explicit_offset": str(dates[1]),
+                    "direct_buckets": len(direct_buckets),
+                },
                 "retained_rows": panel.metadata["retained_rows"],
                 "loss_by_stage": panel.metadata["loss_by_stage"],
                 "ic": result.ic,
@@ -161,6 +359,8 @@ def main(*, plots: bool = False) -> None:
                 "group_adjusted_returns": adjusted.to_dicts(),
                 "factor_weights": weights.to_dicts(),
                 "factor_returns": portfolio_returns.to_dicts(),
+                "factor_regression": factor_regression.statistics.to_dicts(),
+                "factor_regression_observations": factor_regression.observations.to_dicts(),
                 "factor_wealth": factor_wealth.to_dicts(),
                 "arithmetic_series_total_return": portfolio_summary.total_return,
                 "daily_quantiles": daily_quantiles.to_dicts(),
@@ -190,4 +390,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Inspect actual spread, monthly IC and persistence data (viz extra)",
     )
-    main(plots=parser.parse_args().plots)
+    parser.add_argument(
+        "--engineer-outcomes",
+        action="store_true",
+        help="Also exercise optional Engineer native outcomes; requires a version exposing labeling.forward_returns",
+    )
+    arguments = parser.parse_args()
+    main(plots=arguments.plots, engineer_outcomes=arguments.engineer_outcomes)

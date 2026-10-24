@@ -7,10 +7,18 @@ Factor-style signal analysis with a clean public surface.
 - `core.py` - `analyze_signal`
 - `_prepared.py` and `core.py` - strict `analyze_prepared_signal` input and shared calculations
 - `panel.py` - `prepare_signal_panel`, owned common supplied-return samples and staged losses
+- `_price_outcomes.py` - explicit price research views using the shared return/statistics kernels
+- `_outcomes.py` - one long-outcome normalization with retained endpoint/availability provenance
 - `result.py` - `SignalResult`
 - `signal_ic.py` - per-date/group IC observations and legacy finite-series extraction
+- `information.py` - owned complete information-report samples, inference and month/group means
 - `returns.py` - inspectable finite-pair date/group return demeaning shared with IC
 - `portfolio.py` - shared factor-weight normalization and supplied-return contributions
+- `positions.py` and `portfolio_inputs.py` - explicit-expiry research allocations and owned daily portfolio interchange
+- `factor_regression.py` - same-universe dated OLS, explicit compound alpha and owned samples
+- `returns_report.py` - owned return-analysis orchestration over shared weights, regressions, quantile statistics and wealth products; raw/display units and requested empty cells remain separate
+- `events.py` - observed-clock event paths, explicit level/wealth units and date/group samples
+- `event_study.py` - composed factor statistics, elapsed event bins and raw/rate dated samples
 - `quantile.py` - shared sample reduction, daily/equal-date quantile statistics and pooled returns/spread
 - `turnover.py` - turnover and signal autocorrelation
 - `_report.py` - text/report formatting helpers
@@ -27,11 +35,21 @@ print(result.ic["1D"], result.ic_t_stat["1D"])
 `analyze_prepared_signal` accepts already-complete panels without prices or new bucket assignments.
 Its result retains an owned `prepared_data` snapshot. Supplied horizon labels do not establish a
 calendar or session/bar validation; native pooled quantile/spread definitions still apply.
+`PreparedSignalPanel.from_prepared` uses the same strict validator to own an already-clean
+table and its supplied sparse bucket IDs without recalculation. The familiar
+`compat.alphalens.tears.create_information_tear_sheet` delegates to the native information
+analysis/report; a declared pandas output grid retains missing dates as unknown ICs, not factor rows.
 
 `prepare_signal_panel` cleans one common factor/return/group sample before shared qcut/cut
 bucketing. Its owned panel exposes independent data/audit copies; `analyze()` delegates to the
-existing prepared analysis engine for integer-D selectors and contiguous buckets. Do not infer
+existing prepared analysis engine for exact supplied selectors and actual positive bucket IDs.
+Results retain horizon_labels and quantile_ids through JSON and visualization bridges. Automatic
+turnover uses only positive exact-day labels as observed-date lags, not elapsed durations. Do not infer
 group-neutral weights, calendar validation or full report coverage from bucketing alone.
+The optional prices route requires a declared price basis and records observation-grid,
+endpoint, fill/filter and original quote-presence semantics. Analytical views do not create
+execution bars. Supplied long outcomes use horizon_col and retain their owned outcome_data;
+ordinary supplied outcomes require no price, provider or Engineer installation.
 Use `panel.ic_by_date(group_adjust=..., by_group=...)` for explicit adjusted/grouped IC observations,
 counts and undefined statuses. `panel.demean_returns(by_group=...)` exposes the shared adjusted
 outcomes without changing keys or buckets. The direct `compute_signal_ic` and `demean_signal_returns`
@@ -43,6 +61,27 @@ zero signal means zero exposure. These are not dated holdings/expiration account
 before those same weights and compound one supplied horizon using the existing NaN-aware product.
 They retain actual return/count missingness, labelled observation-order wealth and an explicit
 flat-wealth policy. No calendar, holding expiration or self-financing daily accounting is inferred.
+`SyntheticPortfolioInputs.to_pyfolio()` retains a minimal independent research-origin marker on
+each pandas result; familiar account reports preserve it without relabeling research as execution.
+`panel.factor_alpha_beta` and `compute_factor_alpha_beta` reuse those weights/returns and the
+existing OLS kernel against equal-asset same-universe means. They require explicit horizon scales
+for compounded alpha, retain joint dated samples/counts and undefined statuses, and expose owned
+Arrow/JSON snapshots. Supplied portfolio returns bypass weights; no t-statistic, holdings or complete
+returns report is inferred. Generic portfolio alpha retains its existing linear annualization.
+
+`panel.event_study` and `analyze_signal_events` align supplied levels or compounded returns,
+retaining raw paths, missing cells, date/group observations, sample deviations and event counts.
+They reuse existing wealth/statistics kernels and preserve every event ID. They are not CAR,
+calendar-grid validation or complete legacy event sheets. `AlignedEventResult` owns Arrow/JSON
+snapshots; existing event plots and HTML composition render actual paths without synthetic data.
+`panel.event_returns` and `analyze_event_returns` retain the overall analysis alongside optional
+group summaries in `EventReturnsResult`. `plot_event_returns` and `generate_event_returns_report`
+compose the global overview, optional per-quantile sample deviations and group overviews. This
+is the event-returns report, not the separate event-study sheet or all seven legacy sheets.
+`analyze_signal_event_study` composes the separate signal event-study report from an owned
+prepared panel. It retains raw inputs, elapsed-bin membership, date-weighted return statistics
+and explicit dimensionless rate powers. Optional paths retain observed-row units. The HTML
+composer and `plot_signal_event_study` expose real table/plot data, not an abnormal-return model.
 
 `panel.quantile_statistics` retains date/group/bucket means, sample errors and asset counts, or
 reduces daily means with equal date weight and explicit date counts. Its adjusted returns reuse
@@ -59,3 +98,8 @@ Spearman averaging remains distinct. Persistence-enabled analyses retain both da
 `SignalResult` and its JSON; `to_turnover_result` and `to_tear_sheet` expose actual dated observations
 and summaries in the existing report. Cumulative paths and complete chart/sheet coverage remain
 separate; no unavailable data or confidence bands are synthesized from scalar means.
+
+`visualization.signal.plot_signal_turnover` and `generate_signal_turnover_report` compose every
+recorded membership/rank lag and owned tables from `TurnoverAnalysisResult`. The dashboard uses the
+same collection. Lags retain their observed/supplied clock, not an inferred calendar or return
+horizon. Other composed sheets and portfolio/interchange workflows remain separate.
