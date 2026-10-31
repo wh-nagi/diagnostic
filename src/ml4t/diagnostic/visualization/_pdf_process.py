@@ -170,6 +170,7 @@ class _WindowsJob:
             function = getattr(self.api, name)
             function.argtypes = args
             function.restype = result
+        self.worker_pids = {pid}
         self.handle = self.api.CreateJobObjectW(None, None)
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -197,7 +198,7 @@ class _WindowsJob:
         if not ok:
             raise ctypes.WinError(ctypes.get_last_error())
 
-    def terminate(self, processes: list[psutil.Process]) -> None:
+    def terminate(self, processes: list[psutil.Process], *, worker_exited: bool) -> None:
         from ctypes import wintypes
 
         class Accounting(ctypes.Structure):
@@ -211,6 +212,39 @@ class _WindowsJob:
 
         handles = []
         try:
+            started = time.monotonic()
+            deadline = started + 5
+            # Kernel job membership remains authoritative while the worker is alive.
+            capacity = 64
+            while True:
+
+                class ProcessIds(ctypes.Structure):
+                    _fields_ = [
+                        ("assigned", wintypes.DWORD),
+                        ("listed", wintypes.DWORD),
+                        ("pids", ctypes.c_size_t * capacity),
+                    ]
+
+                members = ProcessIds()
+                complete = self.api.QueryInformationJobObject(
+                    self.handle, 3, ctypes.byref(members), ctypes.sizeof(members), None
+                )
+                if complete and members.listed >= members.assigned:
+                    break
+                error = ctypes.get_last_error()
+                if not complete and error != 234:
+                    raise ctypes.WinError(error)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("PDF job membership did not stabilize before cleanup")
+                capacity = max(capacity * 2, members.assigned)
+            running_pids = {process.pid for process in processes if process.is_running()}
+            processes = list(processes)
+            for pid in members.pids[: members.listed]:
+                if pid not in running_pids:
+                    try:
+                        processes.append(psutil.Process(pid))
+                    except psutil.NoSuchProcess:
+                        pass
             for process in processes:
                 if not process.is_running():
                     continue
@@ -240,10 +274,10 @@ class _WindowsJob:
                     handles.append((process.pid, handle, membership, identity, can_terminate))
                 elif ctypes.get_last_error() != 87:  # PID already gone
                     raise ctypes.WinError(ctypes.get_last_error())
-            started = time.monotonic()
-            deadline = started + 5
-            # Keep the worker's pipe readers alive until its browser descendants exit.
-            for pid, handle, membership, identity, can_terminate in reversed(handles):
+            job_terminated = False
+
+            def request_termination(item):
+                _, handle, membership, _, can_terminate = item
                 state = self.api.WaitForSingleObject(handle, 0)
                 if state == 258 and membership and can_terminate:
                     if not self.api.TerminateProcess(handle, 120):
@@ -252,6 +286,17 @@ class _WindowsJob:
                         # Only the following process-handle wait establishes completion.
                         if error != 5 and self.api.WaitForSingleObject(handle, 0) != 0:
                             raise ctypes.WinError(error)
+
+            if not worker_exited:
+                # Native exit can depend on another owned process being stopped first.
+                for item in reversed(handles):
+                    if item[0] not in self.worker_pids:
+                        request_termination(item)
+            # A descendant can depend on resources retained by the worker itself.
+            # Stop the complete owned job before waiting on any member's native exit.
+            self._check(self.api.TerminateJobObject(self.handle, 120))
+            job_terminated = True
+            for pid, handle, membership, identity, can_terminate in handles:
                 remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
                 result = self.api.WaitForSingleObject(handle, remaining_ms)
                 if result != 0:
@@ -262,14 +307,14 @@ class _WindowsJob:
                         else None
                     )
                     raise RuntimeError(
-                        f"Owned PDF process {pid} not terminal before job termination: "
+                        f"Owned PDF process {pid} not terminal "
+                        f"{'after' if job_terminated else 'before'} job termination: "
                         f"wait result {result}; identity={identity}, "
                         f"member_before_termination={membership}, exit_code={observed_exit}, "
                         f"termination_access={can_terminate}, "
                         f"cleanup_elapsed={time.monotonic() - started:.6f}, "
                         f"wait_budget_ms={remaining_ms}"
                     )
-            self._check(self.api.TerminateJobObject(self.handle, 120))
             while True:
                 accounting = Accounting()
                 self._check(
@@ -323,10 +368,28 @@ class _OwnedProcesses:
         except psutil.NoSuchProcess:
             pass
 
+    def observe_worker(self, pid: int) -> None:
+        if self.job is None or pid in self.job.worker_pids:
+            return
+        try:
+            worker = psutil.Process(pid)
+            lineage = [worker, *worker.parents()]
+            root = next((index for index, item in enumerate(lineage) if item == self.root), None)
+            if root is None:
+                raise RuntimeError("PDF interpreter is not a child of its owned launcher")
+            for item in lineage[: root + 1]:
+                self.observed[item.pid] = item
+                self.job.worker_pids.add(item.pid)
+        except psutil.NoSuchProcess:
+            # Final progress can be read after the interpreter has already exited.
+            pass
+
     def terminate(self) -> None:
         self.observe()
         if self.job is not None:
-            self.job.terminate(list(self.observed.values()))
+            self.job.terminate(
+                list(self.observed.values()), worker_exited=self.process.poll() is not None
+            )
         else:
             # Chrome starts a new session of its own. Kill observed child-led groups too.
             for process in reversed(list(self.observed.values())):
@@ -433,6 +496,8 @@ def render_pdf_pages(figures: list[Any], paths: list[Path], **options: Any) -> N
                 if not next_path.exists():
                     return
                 status = _read_status(next_path)
+                if owner is not None and (worker_pid := status.get("worker_pid")) is not None:
+                    owner.observe_worker(worker_pid)
                 sequence += 1
 
         try:

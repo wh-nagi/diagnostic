@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: "0.10.9"
       - name: Set up Python ${{ matrix.python-version }}
@@ -41,4 +41,5 @@ jobs:
           tests/test_visualization/test_pdf_report_lifecycle.py
           tests/test_visualization/test_pdf_process_ownership.py
           tests/test_visualization/test_report_generation.py
-          -q -s -n 0 --timeout 120 --tb=short
+          tests/test_visualization/test_report_literal_titles.py
+          -v -s -n 0 --timeout 120 --tb=short

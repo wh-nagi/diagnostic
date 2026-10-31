@@ -3,18 +3,77 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 import tempfile
+import time
 from collections.abc import Iterable
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import kaleido
 from choreographer import Tab
+from choreographer.channels import ChannelClosedError, JSONError, Pipe, _wire
 from kaleido._kaleido_tab import _KaleidoTab
 
 
+class _RendererPipe(Pipe):
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending_bytes = b""
+        if sys.platform == "win32":
+            # Set only our reader, before Chrome inherits the opposite endpoint.
+            os.set_blocking(self._read_from_browser, False)
+
+    def read_jsons(self, *, blocking: bool = True) -> tuple[list[Any], float]:
+        if sys.platform != "win32":
+            return super().read_jsons(blocking=blocking)
+        while self.is_ready():
+            try:
+                data = os.read(self._read_from_browser, 10000)
+            except BlockingIOError:
+                if not blocking:
+                    return [], time.perf_counter()
+                time.sleep(0.01)
+                continue
+            except OSError as error:
+                self.close()
+                raise ChannelClosedError from error
+            if not data or data == b"{bye}\n":
+                self.close()
+                raise ChannelClosedError
+            self._pending_bytes += data
+            complete = self._pending_bytes.split(b"\0")
+            self._pending_bytes = complete.pop()
+            messages = []
+            for frame in complete:
+                if frame:
+                    try:
+                        messages.append(_wire.deserialize(frame.decode("utf-8")))
+                    except JSONError:
+                        logging.getLogger(__name__).exception("Invalid PDF browser JSON frame")
+            if messages or not blocking:
+                return messages, time.perf_counter()
+        raise ChannelClosedError
+
+    def _fake_bye(self) -> None:
+        # Our Windows reader polls readiness. Writing a synthetic bye through
+        # Chrome's inherited endpoint can block behind Chrome's pending WriteFile.
+        if sys.platform != "win32":
+            super()._fake_bye()
+
+    def _unblock_fd(self, fd: int) -> None:
+        # Never change the mode of an endpoint borrowed by Chrome's pending I/O.
+        if sys.platform == "win32" and fd in (self._read_to_browser, self._write_from_browser):
+            return
+        super()._unblock_fd(fd)
+
+
 class _PageEventsKaleido(kaleido.Kaleido):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, channel_cls=_RendererPipe, **kwargs)
+
     async def _conform_tabs(self, tabs: Iterable[Tab] | None = None) -> None:
         if tabs is None:
             # A startup target can stop answering Page.enable before any navigation.
@@ -24,10 +83,21 @@ class _PageEventsKaleido(kaleido.Kaleido):
                 await self.close_tab(target_id)
         else:
             selected = list(tabs)
-        # Page.enable does not replay a load event missed during fast navigation.
         for tab in selected:
+            wrapped = _KaleidoTab(tab, headers=self._headers)
+            await wrapped._apply_headers()
             await tab.send_command("Page.enable")
-        await super()._conform_tabs(selected)
+            navigation = await tab.send_command("Page.navigate", params={"url": self._index})
+            if not isinstance(navigation, dict) or "error" in navigation:
+                raise RuntimeError(f"PDF renderer navigation failed: {navigation!r}")
+            if navigation.get("result", {}).get("errorText"):
+                raise RuntimeError(f"PDF renderer navigation failed: {navigation!r}")
+            await tab.send_command("Page.enable")
+            # Same-document navigation need not emit another Page.loadEventFired.
+            await self._renderer_document_ready(wrapped)
+            wrapped.js_logger.reset()
+            self._total_tabs += 1
+            await self.tabs_ready.put(wrapped)
 
     async def _get_kaleido_tab(self) -> _KaleidoTab:
         wrapped = await super()._get_kaleido_tab()
@@ -122,10 +192,14 @@ async def _render(request_path: Path, status_path: Path) -> None:
         destination = status_path.with_name(f"{status_path.stem}-{sequence:06d}.json")
         temporary = destination.with_suffix(".new")
         temporary.write_text(
-            json.dumps({"phase": phase, "completed": completed, **details}), encoding="utf-8"
+            json.dumps(
+                {"phase": phase, "completed": completed, "worker_pid": os.getpid(), **details}
+            ),
+            encoding="utf-8",
         )
         temporary.replace(destination)
 
+    status("starting")
     renderer = _PageEventsKaleido(n=1, timeout=90, **request["defaults"])
 
     async def pages() -> None:
